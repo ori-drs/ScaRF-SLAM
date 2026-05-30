@@ -1,0 +1,30 @@
+%YAML:1.0
+
+
+# general parameters
+imu: 1 # if zero we do full 6 dof, otherwise if 1 then 4 dof optimization
+output_path: null # where to save final trajectory
+
+
+# loop closure saving parameters
+load_previous_pose_graph: 0 # load and reuse previous pose graph; load from 'pose_graph_load_path'
+pose_graph_load_path: "XXX"
+save_image: 0 # save image in pose graph for visualization prupose; you can close this function by setting 0
+
+
+# loop closure parameters
+recall_ignore_recent_ct: 150 # how many frames we should skip that are recent (avoid matching to recent frames)
+min_score: 0.015 # min score from dbow to try to loop closure with (0.015 default)
+pnp_inflation: 10.0 # amount to inflate pnp ransac sigma by (10.0 default)
+min_optimization_time_diff: 10.0 # seconds, minimum time between pose graph optimizations
+
+max_theta_diff: 170.0 # max orientation diff between keyframe and query frame (degrees)
+max_pos_diff: 1.5 # max position diff between keyframe and query frame (meters)
+min_loop_feat_num: 30 # minimum number of features needed to be matched between the keyframe and query frame
+brief_match_hamming_thresh: 100 # BRIEF descriptor Hamming threshold for tentative matches before PnP
+
+# keyframing parameters
+serial: true # if true, process synchronized OpenVINS inputs FIFO without skip_first_seconds/skip_cnt/skip_dist keyframe skipping
+skip_first_seconds: 0.5 # seconds from first synchronized keyframe candidate header stamp to discard
+skip_dist: 0.001 # meters, distance between keyframes
+skip_cnt: 2 # num, skip every n frames (typically don't need unless high framerate)

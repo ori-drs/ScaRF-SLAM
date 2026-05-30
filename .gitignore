@@ -1,0 +1,10 @@
+.vscode
+
+__pycache__/
+*.pyc
+*.pyo
+.agents
+.codex
+.pytest_cache
+
+tmp/

@@ -1,0 +1,59 @@
+model_name: da
+
+use_slam: false
+is_mono: false
+trajectory: gt
+slam_trajectory_topic: null
+slam_final_trajectory_topic: /insta/poses_gt
+slam_odometry_topic: null
+slam_image_topic: /insta/cam0/image_raw/compressed
+image_pose_timestamp_tolerance_sec: 0.005
+
+frame_scale_opt: true
+submap_scale_opt: true
+point_cloud_fusion: true
+
+select_kf_on_time: true
+sec_skip: 0.32
+
+kf_distance: 0.2
+kf_distance_large: 0.2     # use 1.0 if data contains large open spaces (outdoor)
+kf_angle_deg: 10
+max_distance: 5            # use 0 for adaptive max range filtering
+num_ref_poses_per_batch: 6
+num_ref_poses_per_submap: 6
+overlap_ref_views: 1
+
+publish_ros2_pointcloud: false
+publish_ros2_path: false
+publish_ros2_images: false
+
+pinhole_intrinsics: [463.994229, 463.245244, 400, 300]
+pinhole_resolution: [800, 600]
+
+fisheye_cam0:
+  T_cam_imu:
+    - [-0.002509588493586068, -0.007951560887570486, -0.9999652367182805, 0.020537974298963885]
+    - [-0.999991140467742, -0.003359438552965832, 0.002536367212455759, -0.015526673245704435]
+    - [-0.0033794898461800282, 0.9999627427319794, -0.007943059632122856, -0.024044697508017448]
+    - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [0.031511281195814984, -0.011653488085419278, -0.0021546766344171507, 0.00021719584539155157]
+  distortion_model: equidistant
+  intrinsics: [463.9994465216521, 463.25045311566834, 735.024509773121, 719.708087825285]
+  resolution: [1472, 1440]
+
+# Not used for mapping by default in current released implementation
+fisheye_cam1:
+  T_cam_imu:
+    - [-0.005726574176726229, 0.006906060331209163, 0.9999597555296402, -0.020868789451823175]
+    - [-0.9999831343591747, -0.0010077074793853336, -0.005719748493982879, -0.015859484055136982]
+    - [0.00096816599655275, -0.999975645131588, 0.006911714567705285, -0.014153057877198833]
+    - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [0.03252235879516494, -0.011727709324437773, -0.0022335496805661686, 0.000227674640513267]
+  distortion_model: equidistant
+  intrinsics: [465.5512179478029, 464.4094595536328, 735.812188071991, 718.3267258840588]
+  resolution: [1472, 1440]

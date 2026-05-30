@@ -1,0 +1,33 @@
+model_name: da
+
+use_slam: true
+is_mono: false
+trajectory: ov
+slam_trajectory_topic: /ov_slam/trajectory
+slam_final_trajectory_topic: /ov_slam/trajectory_final
+slam_odometry_topic: /ov_slam/odometry
+slam_image_topic: /ov_slam/image/compressed
+image_pose_timestamp_tolerance_sec: 0.005
+
+frame_scale_opt: true
+submap_scale_opt: true
+point_cloud_fusion: true
+
+select_kf_on_time: true
+sec_skip: 0.32
+
+kf_distance: 0.3
+kf_distance_large: 1.0     # use 1.0 if data contains large open spaces (outdoor)
+kf_angle_deg: 10
+max_distance: 0            # use 0 for adaptive max range filtering
+num_ref_poses_per_batch: 6
+num_ref_poses_per_submap: 6
+overlap_ref_views: 1
+
+publish_ros2_pointcloud: false
+publish_ros2_path: false
+publish_ros2_images: false
+
+# To be filled
+pinhole_intrinsics: [0, 0, 0, 0]
+pinhole_resolution: [0, 0]
