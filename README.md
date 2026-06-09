@@ -11,6 +11,7 @@
 
   [<img src="https://img.shields.io/badge/arXiv--b31b1b?style=social&logo=arxiv" alt="Arxiv">](https://arxiv.org/abs/2606.00307v1)
   [<img src="https://img.shields.io/badge/YouTube--red?style=social&logo=youtube" alt="YouTube">](https://www.youtube.com/watch?v=t1JDXg-N25U)
+  [<img src="https://img.shields.io/badge/Bilibili--red?style=social&logo=bilibili" alt="Bilibili">](https://www.bilibili.com/video/BV1EGVz6yESn/)
   [<img src="https://img.shields.io/badge/Google%20Drive--4285F4?style=social&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8cGF0aCBmaWxsPSIjNDI4NUY0IiBkPSJNMTIuMDEgMS40ODVjLTIuMDgyIDAtMy43NTQuMDItMy43NDMuMDQ3LjAxLjAyIDEuNzA4IDMuMDAxIDMuNzc0IDYuNjJsMy43NiA2LjU3NGgzLjc2YzIuMDgxIDAgMy43NTMtLjAyIDMuNzQyLS4wNDctLjAwNS0uMDItMS43MDgtMy4wMDEtMy43NzUtNi42MmwtMy43Ni02LjU3NHoiLz4KICA8cGF0aCBmaWxsPSIjMzRBODUzIiBkPSJNNy4yNSAzLjIxNWE3ODkuODI4IDc4OS44NjEgMCAwIDAtMy42MyA2LjMxOUwwIDE1Ljg2OGwxLjg5IDMuMjk4IDEuODg1IDMuMjk3IDMuNjItNi4zMzUgMy42MTgtNi4zMy0xLjg4LTMuMjg3QzguMSA0LjcwNCA3LjI1NSAzLjIyIDcuMjUgMy4yMTR6Ii8+CiAgPHBhdGggZmlsbD0iI0ZCQkMwNCIgZD0iTTkuNTA5IDE1Ljg2OGwtLjIwMy4zNDhjLS4xMTQuMTk4LS45NiAxLjY3Mi0xLjg4IDMuMjg3YTQyMy45MyA0MjMuOTQ4IDAgMCAxLTEuNjk4IDIuOTdjLS4wMS4wMjYgMy4yNC4wNDIgNy4yMjIuMDQyaDcuMjQ0bDEuNzk2LTMuMTU3Yy45OTItMS43MzQgMS44NS0zLjIzIDEuOTA2LTMuMzIzbC4xMDQtLjE2N2gtNy4yNDl6Ii8+Cjwvc3ZnPgo=" alt="Drive">](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)
 
   <img src="media/recon_demo.jpg" alt="ScaRF-SLAM reconstruction demo" width="90%">
@@ -23,8 +24,8 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
 ## Table of Contents
 
 - [🎬 Preview](#-preview)
-- [📦 Environment Setup](#-environment-setup)
 - [📷 Dataset](#-dataset)
+- [📦 Environment Setup](#-environment-setup)
 - [🗺️ Offline Reconstruction](#-offline-reconstruction)
 - [🚀 Online Reconstruction with SLAM](#-online-reconstruction-with-slam)
 - [🔀 Multi-Session Mapping](#-multi-session-mapping)
@@ -42,6 +43,34 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
   <img alt="" src="media/walk_demo.gif" width="47%" hspace="6" vspace="6" />
   <img alt="" src="media/multi_session_demo.gif" width="47%" hspace="6" vspace="6" />
 </div>
+
+## 📷 Dataset
+
+<div align="center">
+  <img src="media/dataset.jpg" alt="ScaRF-SLAM dataset overview" width="99%">
+</div>
+
+We provide a dataset with accurate ground-truth trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)). The dataset contains five sequences. Each sequence follows the folder structure below (using `R01` as an example):
+```text
+r01
+├── r01_bag
+│   ├── metadata.yaml
+│   └── r01_bag_0.mcap
+└── r01_gt
+    ├── cloud_gt_fov
+    │   ├── <sec>_<nsec>.pcd
+    │   ├── <sec>_<nsec>.pcd
+    │   └── ...
+    ├── cloud_gt.pcd
+    ├── poses_gt.csv
+    └── poses_gt.txt
+```
+
+- `r01_bag`: ROS 2 data bag containing fisheye images and IMU measurements.
+- `cloud_gt_fov`: sparse undistorted LiDAR point clouds at each timestamp in the local camera coordinate frame, with points outside the camera field of view removed. Used for recall evaluation.
+- `cloud_gt.pcd`: dense registered and undistorted LiDAR point cloud. Used for precision and reconstruction error evaluation.
+- `poses_gt.csv`: ground-truth camera trajectory in CSV format.
+- `poses_gt.txt`: ground-truth camera trajectory in TUM format.
 
 ## 📦 Environment Setup
 
@@ -95,35 +124,6 @@ git clone git@github.com:ori-drs/ov_secondary_scarf.git
 cd ~/ros2_ws
 colcon build --symlink-install
 ```
-
-## 📷 Dataset
-
-<div align="center">
-  <img src="media/dataset.jpg" alt="ScaRF-SLAM dataset overview" width="99%">
-</div>
-
-The dataset contains five sequences ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)). Each sequence follows the folder structure below (using `R01` as an example):
-```text
-r01
-├── r01_bag
-│   ├── metadata.yaml
-│   └── r01_bag_0.mcap
-└── r01_gt
-    ├── cloud_gt_fov
-    │   ├── <sec>_<nsec>.pcd
-    │   ├── <sec>_<nsec>.pcd
-    │   └── ...
-    ├── cloud_gt.pcd
-    ├── poses_gt.csv
-    └── poses_gt.txt
-```
-
-- `r01_bag`: ROS 2 data bag containing fisheye images and IMU measurements.
-- `cloud_gt_fov`: sparse undistorted LiDAR point clouds at each timestamp in the local camera coordinate frame, with points outside the camera field of view removed. Used for recall evaluation.
-- `cloud_gt.pcd`: dense registered and undistorted LiDAR point cloud. Used for precision and reconstruction error evaluation.
-- `poses_gt.csv`: ground-truth camera trajectory in CSV format.
-- `poses_gt.txt`: ground-truth camera trajectory in TUM format.
-
 
 ## 🗺️ Offline Reconstruction
 
