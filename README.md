@@ -121,8 +121,8 @@ sudo apt update
 sudo apt install libeigen3-dev libboost-all-dev libceres-dev
 
 cd ~/ros2_ws/src
-git clone git@github.com:rpng/open_vins.git
-git clone git@github.com:ori-drs/ov_secondary_scarf.git
+git clone https://github.com/rpng/open_vins.git
+git clone https://github.com/ori-drs/ov_secondary_scarf.git
 cd ~/ros2_ws
 colcon build --symlink-install
 ```
