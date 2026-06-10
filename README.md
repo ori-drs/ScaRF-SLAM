@@ -24,7 +24,7 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
 ## Table of Contents
 
 - [🎬 Preview](#-preview)
-- [📷 Dataset](#-dataset)
+- [📷 Real-World Dataset](#-real-world-dataset)
 - [📦 Environment Setup](#-environment-setup)
 - [🗺️ Offline Reconstruction](#-offline-reconstruction)
 - [🚀 Online Reconstruction with SLAM](#-online-reconstruction-with-slam)
@@ -44,13 +44,16 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
   <img alt="" src="media/multi_session_demo.gif" width="47%" hspace="6" vspace="6" />
 </div>
 
-## 📷 Dataset
+## 📷 Real-World Dataset
+
+We captured a real-world dataset with accurate ground-truth trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)).
+It was recorded using the front fisheye camera and IMU of an Insta360 ONE RS 1-Inch, which was rigidly mounted to a LiDAR–inertial mapping system. Ground-truth poses were obtained by registering the undistorted LiDAR scans to a high-precision terrestrial laser scanner map.
 
 <div align="center">
   <img src="media/dataset.jpg" alt="ScaRF-SLAM dataset overview" width="99%">
 </div>
 
-We provide a dataset with accurate ground-truth trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)). The dataset contains five sequences. Each sequence follows the folder structure below (using `R01` as an example):
+The dataset contains five sequences. Each sequence follows the folder structure below (using `R01` as an example):
 ```text
 r01
 ├── r01_bag
