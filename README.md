@@ -47,13 +47,12 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
 ## 📷 Real-World Dataset
 
 We evaluate ScaRF-SLAM on a real-world dataset collected at the Oxford Robotics Institute (ORI) with accurate ground-truth camera trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)).
-The dataset is recorded using the front fisheye camera and IMU of an Insta360 ONE RS 1-Inch, rigidly mounted to a LiDAR–inertial mapping system. Ground-truth poses are obtained by registering the undistorted LiDAR scans to a high-precision terrestrial laser scanner map.
 
 <div align="center">
   <img src="media/dataset.jpg" alt="ScaRF-SLAM dataset overview" width="99%">
 </div>
 
-The dataset contains five sequences. Each sequence follows the folder structure below (using `R01` as an example):
+The dataset is recorded using the front fisheye camera and IMU of an Insta360 ONE RS 1-Inch, rigidly mounted to a LiDAR–inertial mapping system. Ground-truth poses are obtained by registering the undistorted LiDAR scans to a high-precision terrestrial laser scanner map. It contains five sequences, each organized according to the folder structure below (using `R01` as an example):
 ```text
 r01
 ├── r01_bag
