@@ -28,7 +28,7 @@ publish_ros2_pointcloud: false
 publish_ros2_path: false
 publish_ros2_images: false
 
-pinhole_intrinsics: [463.994229, 463.245244, 400, 300]
+pinhole_intrinsics: [463.99945, 463.25045, 400, 300]
 pinhole_resolution: [800, 600]
 
 fisheye_cam0:
