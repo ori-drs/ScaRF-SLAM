@@ -1756,7 +1756,7 @@ class ScaRFSLAM():
                 "ros2_pointcloud_downsample_ratio must be between 0 and 1 when publish_ros2_pointcloud is enabled"
             )
         self._setup_ros2_publisher()
-        self.recon_save_folder_name = f"{self.config.get("trajectory")}"
+        self.recon_save_folder_name = f"{self.config.get('trajectory')}"
         if self.config.get("use_slam"):
             self.recon_save_folder_name = self.recon_save_folder_name + "_slam"
 

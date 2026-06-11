@@ -89,7 +89,7 @@ Check the [official repository](https://github.com/bytedance-seed/depth-anything
 
 ```bash
 cd ~/git/
-git clone git@github.com:ByteDance-Seed/Depth-Anything-3.git
+git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
 cd Depth-Anything-3
 
 pip install xformers torch\>=2 torchvision
@@ -121,8 +121,8 @@ sudo apt update
 sudo apt install libeigen3-dev libboost-all-dev libceres-dev
 
 cd ~/ros2_ws/src
-git clone git@github.com:rpng/open_vins.git
-git clone git@github.com:ori-drs/ov_secondary_scarf.git
+git clone https://github.com/rpng/open_vins.git
+git clone https://github.com/ori-drs/ov_secondary_scarf.git
 cd ~/ros2_ws
 colcon build --symlink-install
 ```
@@ -238,6 +238,7 @@ slam_image_topic: /ov_slam/image/compressed
 In terminal 1:
 
 ```bash
+source ~/ros2_ws/install/setup.zsh
 cd ~/git/ScaRF-SLAM
 ros2 launch launch/run_ov_slam.launch.py \
   output_path:=$OUTPUT_FOLDER
@@ -248,6 +249,7 @@ ros2 launch launch/run_ov_slam.launch.py \
 In terminal 2:
 
 ```bash
+source ~/ros2_ws/install/setup.zsh
 ros2 bag play $DATASET_BAG --clock --rate 0.25
 ```
 
@@ -267,6 +269,7 @@ python3 run_mapping.py \
 For online visualization, enable `publish_ros2*` in the config and run:
 
 ```bash
+source ~/ros2_ws/install/setup.zsh
 rviz2 -d launch/scarf_slam.rviz
 ```
 

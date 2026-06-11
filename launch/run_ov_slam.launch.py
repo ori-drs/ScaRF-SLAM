@@ -324,6 +324,7 @@ def launch_setup(context):
         image_conversion_process = ExecuteProcess(
             condition=IfCondition(LaunchConfiguration("image_conversion")),
             cmd=[
+                "/usr/bin/python3",
                 image_conversion_script,
                 *_image_conversion_topics(max_cameras),
                 "--ros-args",
