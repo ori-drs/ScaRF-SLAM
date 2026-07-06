@@ -114,7 +114,7 @@ pip install rosbags open3d gtsam vismatch
 
 ### (Optional) Install OV-SLAM
 
-OV-SLAM refers to [OpenVINS](https://docs.openvins.com/getting-started.html) plus [ov_secondary](https://github.com/rpng/ov_secondary) for pose graph optimization.
+OV-SLAM refers to [OpenVINS](https://docs.openvins.com/getting-started.html) plus [ov_secondary](https://github.com/ori-drs/ov_secondary_scarf.git) for pose graph optimization.
 
 ```bash
 sudo apt update
@@ -126,6 +126,8 @@ git clone https://github.com/ori-drs/ov_secondary_scarf.git
 cd ~/ros2_ws
 colcon build --symlink-install
 ```
+
+Our implementation requires `Ceres 2.2.0`. For compatibility with older Ceres versions, use the [compat/ceres-2.0.0](https://github.com/ori-drs/ov_secondary_scarf/tree/compat/ceres-2.0.0) branch.
 
 ## 🗺️ Offline Reconstruction
 
