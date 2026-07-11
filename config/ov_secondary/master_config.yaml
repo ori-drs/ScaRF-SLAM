@@ -23,8 +23,9 @@ max_pos_diff: 1.5 # max position diff between keyframe and query frame (meters)
 min_loop_feat_num: 30 # minimum number of features needed to be matched between the keyframe and query frame
 brief_match_hamming_thresh: 100 # BRIEF descriptor Hamming threshold for tentative matches before PnP
 
+
 # keyframing parameters
-serial: true # if true, process synchronized OpenVINS inputs FIFO without skip_first_seconds/skip_cnt/skip_dist keyframe skipping
+serial: 1 # if 1, process synchronized OpenVINS inputs FIFO
 skip_first_seconds: 0.5 # seconds from first synchronized keyframe candidate header stamp to discard
 skip_dist: 0.001 # meters, distance between keyframes
-skip_cnt: 2 # num, skip every n frames (typically don't need unless high framerate)
+skip_cnt: 1 # num, skip every n frames
