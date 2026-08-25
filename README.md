@@ -1,5 +1,6 @@
 <div align="center">
   <h1>ScaRF-SLAM🧣: Scale-Consistent Reconstruction with Feed-Forward Models and Classical Visual SLAM</h1>
+  <b>IEEE Robotics and Automation Letters (RA-L) 2026</b>
   <p>
     <a href="https://yuhaozhang7.github.io" target="_blank">Yuhao Zhang</a><sup>1</sup>,
     <a href="https://yifutao.github.io/" target="_blank">Yifu Tao</a><sup>1</sup>,
@@ -17,7 +18,7 @@
   <img src="media/recon_demo.jpg" alt="ScaRF-SLAM reconstruction demo" width="90%">
 </div>
 
-ScaRF-SLAM is a dense visual mapping framework that combines the robustness of classical visual SLAM with the reconstruction capability of modern geometric foundation models (GFMs). Instead of relying on learned geometry for camera tracking, ScaRF-SLAM decouples localization and dense mapping: classical SLAM provides accurate, low-latency pose estimation, while GFMs are used exclusively for feed-forward depth prediction and reconstruction. By anchoring dense mapping to reliable SLAM poses and enforcing lightweight scale-consistency optimization across frames and submaps, the system achieves globally consistent, high-quality 3D reconstruction while remaining robust to limited batch sizes and loop closures. The framework is compatible with a wide range of SLAM configurations — including monocular, stereo, mono-inertial, multi-camera, and fisheye-camera systems — making it practical for real-world robotics and large-scale mapping applications.
+ScaRF-SLAM is a dense visual mapping framework that combines the robustness of classical visual SLAM with the reconstruction capability of modern geometric foundation models (GFMs). Instead of relying on learned geometry for camera tracking, ScaRF-SLAM decouples localization and dense mapping: classical SLAM provides accurate, low-latency pose estimation, while GFMs are used exclusively for feed-forward depth prediction and reconstruction. By anchoring dense mapping to reliable SLAM poses and enforcing lightweight scale-consistency optimization across frames and submaps, the system achieves globally consistent, high-quality 3D reconstruction while remaining robust to limited batch sizes and loop closures. The framework is compatible with any RGB-based SLAM configuration — including **monocular, stereo, and multi-camera systems, with or without inertial sensing** — making it practical for real-world robotics and large-scale mapping applications.
 
 **You can take your classical visual SLAM system and wrap ScaRF-SLAM around it!**
 
@@ -32,7 +33,7 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
 </div>
 
 
-## 📷 Real-World Dataset
+## 📷 ORI Dataset
 
 We evaluate ScaRF-SLAM on a real-world dataset collected at the Oxford Robotics Institute (ORI) with accurate ground-truth camera trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)).
 
