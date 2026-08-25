@@ -33,7 +33,7 @@ ScaRF-SLAM is a dense visual mapping framework that combines the robustness of c
 </div>
 
 
-## 📷 ORI Dataset
+## 📷 ScaRF Dataset
 
 We evaluate ScaRF-SLAM on a real-world dataset collected at the Oxford Robotics Institute (ORI) with accurate ground-truth camera trajectories and LiDAR point clouds for quantitative evaluation ([download link](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)).
 
