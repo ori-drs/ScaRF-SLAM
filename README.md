@@ -15,12 +15,14 @@
   [<img src="https://img.shields.io/badge/Bilibili--red?style=social&logo=bilibili" alt="Bilibili">](https://www.bilibili.com/video/BV1EGVz6yESn/)
   [<img src="https://img.shields.io/badge/Google%20Drive--4285F4?style=social&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8cGF0aCBmaWxsPSIjNDI4NUY0IiBkPSJNMTIuMDEgMS40ODVjLTIuMDgyIDAtMy43NTQuMDItMy43NDMuMDQ3LjAxLjAyIDEuNzA4IDMuMDAxIDMuNzc0IDYuNjJsMy43NiA2LjU3NGgzLjc2YzIuMDgxIDAgMy43NTMtLjAyIDMuNzQyLS4wNDctLjAwNS0uMDItMS43MDgtMy4wMDEtMy43NzUtNi42MmwtMy43Ni02LjU3NHoiLz4KICA8cGF0aCBmaWxsPSIjMzRBODUzIiBkPSJNNy4yNSAzLjIxNWE3ODkuODI4IDc4OS44NjEgMCAwIDAtMy42MyA2LjMxOUwwIDE1Ljg2OGwxLjg5IDMuMjk4IDEuODg1IDMuMjk3IDMuNjItNi4zMzUgMy42MTgtNi4zMy0xLjg4LTMuMjg3QzguMSA0LjcwNCA3LjI1NSAzLjIyIDcuMjUgMy4yMTR6Ii8+CiAgPHBhdGggZmlsbD0iI0ZCQkMwNCIgZD0iTTkuNTA5IDE1Ljg2OGwtLjIwMy4zNDhjLS4xMTQuMTk4LS45NiAxLjY3Mi0xLjg4IDMuMjg3YTQyMy45MyA0MjMuOTQ4IDAgMCAxLTEuNjk4IDIuOTdjLS4wMS4wMjYgMy4yNC4wNDIgNy4yMjIuMDQyaDcuMjQ0bDEuNzk2LTMuMTU3Yy45OTItMS43MzQgMS44NS0zLjIzIDEuOTA2LTMuMzIzbC4xMDQtLjE2N2gtNy4yNDl6Ii8+Cjwvc3ZnPgo=" alt="Drive">](https://drive.google.com/drive/folders/1yYc3ctsetFZquQLp0JlV6gAeFr_35No8)
 
-  <img src="media/recon_demo.jpg" alt="ScaRF-SLAM reconstruction demo" width="90%">
+  <img src="media/recon_demo.jpg" alt="ScaRF-SLAM reconstruction demo" width="80%">
 </div>
 
-ScaRF-SLAM is a dense visual mapping framework that combines the robustness of classical visual SLAM with the reconstruction capability of modern geometric foundation models (GFMs). Instead of relying on learned geometry for camera tracking, ScaRF-SLAM decouples localization and dense mapping: classical SLAM provides accurate, low-latency pose estimation, while GFMs are used exclusively for feed-forward depth prediction and reconstruction. By anchoring dense mapping to reliable SLAM poses and enforcing lightweight scale-consistency optimization across frames and submaps, the system achieves globally consistent, high-quality 3D reconstruction while remaining robust to limited batch sizes and loop closures. The framework is compatible with any RGB-based SLAM configuration — including **monocular, stereo, and multi-camera systems, with or without inertial sensing** — making it practical for real-world robotics and large-scale mapping applications.
+ScaRF-SLAM is a dense visual mapping framework that combines the robustness of classical visual SLAM with the reconstruction capability of modern geometric foundation models (GFMs). Instead of relying on learned geometry for camera tracking, ScaRF-SLAM decouples localization and dense mapping: classical SLAM provides accurate, low-latency pose estimation, while GFMs are used exclusively for feed-forward depth prediction and reconstruction. By anchoring dense mapping to reliable SLAM poses and enforcing lightweight scale-consistency optimization across frames and submaps, the system achieves globally consistent, high-quality 3D reconstruction while remaining robust to limited batch sizes and loop closures.
+The framework is compatible with any RGB-based SLAM configuration — including **monocular, stereo, and multi-camera systems, with or without inertial sensing** — making it practical for real-world robotics and large-scale mapping applications.
 
-**You can take your classical visual SLAM system and wrap ScaRF-SLAM around it!**
+**You can take your classical visual SLAM system and wrap ScaRF-SLAM around it!**<br>
+Example systems: [OpenVINS](https://github.com/rpng/open_vins/), [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3), [OpenMAVIS](https://github.com/MAVIS-SLAM/OpenMAVIS).
 
 ## 🎬 Preview 
 
@@ -43,6 +45,19 @@ We evaluate ScaRF-SLAM on a real-world dataset collected at the Oxford Robotics 
 
 The dataset is recorded using the front fisheye camera and IMU of an Insta360 ONE RS 1-Inch, rigidly mounted to a LiDAR–inertial mapping system. Ground-truth poses are obtained by registering the undistorted LiDAR scans to a high-precision terrestrial laser scanner map ([more detail](https://github.com/ori-drs/ScaRF-SLAM/wiki/1.-%F0%9F%93%A5-Dataset)).
 
+Reconstruction results at a glance:
+<div align="center">
+  <img src="media/scarf_global_cmp.jpg" alt="reconstruction error" width="80%">
+</div>
+
+
+## 🌍 Outdoor Datasets
+
+ScaRF-SLAM also generalizes to large-scale outdoor environments and datasets with different sensor modalities, such as [KITTI](https://www.cvlibs.net/datasets/kitti/) dataset and [Oxford Spires](https://dynamic.robots.ox.ac.uk/datasets/oxford-spires/) dataset.
+
+<div align="center">
+  <img src="media/recon_demo_outdoor.jpg" alt="ScaRF-SLAM reconstruction demo outdoor" width="99%">
+</div>
 
 ## 💻 Using ScaRF-SLAM
 
@@ -69,7 +84,7 @@ If you find ScaRF-SLAM useful for your research, please consider citing:
 
 ```bibtex
 @article{zhang2026scarfslam,
-  title={{ScaRF-SLAM}: Scale-Consistent Reconstruction with Feed-Forward Models and Classical Visual SLAM},
+  title={{ScaRF-SLAM}: Scale-Consistent Reconstruction with Feed-Forward Models and Classical Visual {SLAM}},
   author={Zhang, Yuhao and Tao, Yifu and Dellaert, Frank and Fallon, Maurice},
   journal={arXiv preprint arXiv:2606.00307},
   year={2026}
