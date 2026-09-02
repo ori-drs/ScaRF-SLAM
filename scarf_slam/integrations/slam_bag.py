@@ -3,12 +3,20 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import imageio.v2 as imageio
 import numpy as np
 
 from scarf_slam.core.pose import MappingPose
+from scarf_slam.integrations.slam_bag_time_sync import (
+    _collect_image_files,
+    _compressed_image_payload,
+    _path_header_target_nsec,
+    _stamp_to_nsec,
+    _timestamp_nsec_key,
+    read_pose_file,
+)
 
 
 DEFAULT_TRAJECTORY_TOPIC = "/scarf_slam/input/trajectory"
@@ -45,6 +53,33 @@ def _path_msg_to_pose_dict(path_msg) -> Dict[str, MappingPose]:
         _stamp_key(pose_stamped.header.stamp): _pose_to_mapping_pose(pose_stamped.pose)
         for pose_stamped in path_msg.poses
     }
+
+
+def _synced_path_snapshot(
+    path_msg,
+    timestamp_map: Mapping[int, int],
+) -> Optional[Tuple[int, str, Dict[str, MappingPose]]]:
+    """Apply the pose→image timestamp map to a Path message: drop unmatched
+    poses, rewrite matched stamps, and restamp the header from the last matched
+    pose. Returns None when no pose matches (such a message would previously
+    have been dropped from the synced bag)."""
+    pose_timestamps_nsec = [
+        _stamp_to_nsec(pose_stamped.header.stamp) for pose_stamped in path_msg.poses
+    ]
+    pose_dict: Dict[str, MappingPose] = {}
+    for pose_stamped, source_nsec in zip(path_msg.poses, pose_timestamps_nsec):
+        target_nsec = timestamp_map.get(source_nsec)
+        if target_nsec is None:
+            continue
+        pose_dict[_timestamp_nsec_key(target_nsec)] = _pose_to_mapping_pose(pose_stamped.pose)
+    if not pose_dict:
+        return None
+    header_nsec = _path_header_target_nsec(
+        _stamp_to_nsec(path_msg.header.stamp),
+        pose_timestamps_nsec,
+        timestamp_map,
+    )
+    return header_nsec, _timestamp_nsec_key(header_nsec), pose_dict
 
 
 def _array_or_bytes_to_bytes(data) -> bytes:
@@ -107,6 +142,7 @@ def load_slam_bag(
     final_trajectory_topic: Optional[str] = DEFAULT_FINAL_TRAJECTORY_TOPIC,
     odometry_topic: Optional[str] = DEFAULT_ODOMETRY_TOPIC,
     image_topic: Optional[str] = DEFAULT_IMAGE_TOPIC,
+    pose_timestamp_map: Optional[Mapping[int, int]] = None,
 ) -> SlamBagData:
     try:
         from rosbags.highlevel import AnyReader
@@ -171,14 +207,30 @@ def load_slam_bag(
         for connection, timestamp, rawdata in reader.messages(connections=connections):
             msg = reader.deserialize(rawdata, connection.msgtype)
             if connection.topic == trajectory_topic:
-                pose_dict = _path_msg_to_pose_dict(msg)
-                trajectory_snapshots[_stamp_key(msg.header.stamp)] = pose_dict
+                if pose_timestamp_map is None:
+                    trajectory_snapshots[_stamp_key(msg.header.stamp)] = _path_msg_to_pose_dict(msg)
+                else:
+                    snapshot = _synced_path_snapshot(msg, pose_timestamp_map)
+                    if snapshot is not None:
+                        trajectory_snapshots[snapshot[1]] = snapshot[2]
             elif connection.topic == final_trajectory_topic:
-                final_trajectory_snapshots.append(
-                    (int(timestamp), _stamp_key(msg.header.stamp), _path_msg_to_pose_dict(msg))
-                )
+                if pose_timestamp_map is None:
+                    final_trajectory_snapshots.append(
+                        (int(timestamp), _stamp_key(msg.header.stamp), _path_msg_to_pose_dict(msg))
+                    )
+                else:
+                    # Order final snapshots by the rewritten header stamp, matching
+                    # the write timestamps the synced bag used to carry.
+                    snapshot = _synced_path_snapshot(msg, pose_timestamp_map)
+                    if snapshot is not None:
+                        final_trajectory_snapshots.append(snapshot)
             elif connection.topic == odometry_topic:
-                odometry[_stamp_key(msg.header.stamp)] = _pose_to_mapping_pose(msg.pose.pose)
+                if pose_timestamp_map is None:
+                    odometry[_stamp_key(msg.header.stamp)] = _pose_to_mapping_pose(msg.pose.pose)
+                else:
+                    target_nsec = pose_timestamp_map.get(_stamp_to_nsec(msg.header.stamp))
+                    if target_nsec is not None:
+                        odometry[_timestamp_nsec_key(target_nsec)] = _pose_to_mapping_pose(msg.pose.pose)
             elif connection.topic == image_topic:
                 key = _stamp_key(msg.header.stamp)
                 compressed_images[key] = _array_or_bytes_to_bytes(msg.data)
@@ -213,6 +265,58 @@ def load_slam_bag(
         bag_path=resolved_bag_path,
         trajectory_snapshots=trajectory_snapshots,
         odometry=odometry,
+        compressed_images=compressed_images,
+        image_formats=image_formats,
+    )
+
+
+def load_slam_data_from_image_folder_and_poses(
+    image_folder: str | Path,
+    poses_path: str | Path,
+    *,
+    pose_timestamp_map: Optional[Mapping[int, int]] = None,
+) -> SlamBagData:
+    """Build SlamBagData directly from an image folder and a pose file
+    (--image_folder/--poses input, use_slam: false), without writing a
+    temporary bag. The pose file acts as the single final-trajectory snapshot,
+    stamped at the last matched pose."""
+    resolved_image_folder = Path(image_folder).expanduser()
+    image_files = _collect_image_files(resolved_image_folder)
+    poses = read_pose_file(poses_path)
+
+    compressed_images: Dict[str, bytes] = {}
+    image_formats: Dict[str, str] = {}
+    for timestamp_nsec, image_path in image_files:
+        image_format, payload = _compressed_image_payload(image_path)
+        key = _timestamp_nsec_key(timestamp_nsec)
+        compressed_images[key] = payload.tobytes()
+        image_formats[key] = image_format
+
+    pose_dict: Dict[str, MappingPose] = {}
+    last_pose_nsec: Optional[int] = None
+    for sec, nsec, x, y, z, qx, qy, qz, qw in poses:
+        source_nsec = int(sec) * 1_000_000_000 + int(nsec)
+        if pose_timestamp_map is None:
+            target_nsec = source_nsec
+        else:
+            target_nsec = pose_timestamp_map.get(source_nsec)
+            if target_nsec is None:
+                continue
+        pose_dict[_timestamp_nsec_key(target_nsec)] = MappingPose(
+            [float(x), float(y), float(z)],
+            [float(qx), float(qy), float(qz), float(qw)],
+        )
+        last_pose_nsec = target_nsec
+    if not pose_dict or last_pose_nsec is None:
+        raise FileNotFoundError(
+            f"No poses in {poses_path} matched an image timestamp in {resolved_image_folder}"
+        )
+
+    snapshot_key = _timestamp_nsec_key(last_pose_nsec)
+    return SlamBagData(
+        bag_path=resolved_image_folder,
+        trajectory_snapshots={snapshot_key: pose_dict},
+        odometry=pose_dict.copy(),
         compressed_images=compressed_images,
         image_formats=image_formats,
     )
