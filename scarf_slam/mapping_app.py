@@ -1795,6 +1795,15 @@ class ScaRFSLAM():
         if self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
             self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
+            if self.config.get("torch_compile", False):
+                # "reduce-overhead" adds CUDA graphs on top; only worth it if a
+                # profile shows kernel-launch gaps, and it needs stable batch shapes.
+                compile_mode = self.config.get("torch_compile_mode", "default")
+                print(
+                    f"[scarf] torch.compile depth model (mode={compile_mode}); "
+                    "expect slow warmup batches while compiling"
+                )
+                self.model.model = torch.compile(self.model.model, mode=compile_mode)
         else:
             raise ValueError(f"Invalid self.model_name: {self.model_name}")
 
@@ -1923,7 +1932,7 @@ class ScaRFSLAM():
                     ref_ts_sub, 
                     self.in_ref_poses_dict,
                     self.ph_views_per_batch,
-                    use_extrinsics=True,
+                    use_extrinsics=("MONO" not in str(self.config.get("da3_model", ""))),
                 )
                 predictions, ph_view_poses_sub, new_ph_to_ref_dict = da_out
             else:
