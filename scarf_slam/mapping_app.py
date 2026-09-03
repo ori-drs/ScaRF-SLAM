@@ -64,10 +64,10 @@ from scarf_slam.utils.timestamp_ops import (
 )
 from scarf_slam.utils import keyframe_selection
 from scarf_slam.integrations.slam_bag_time_sync import (
-    cleanup_synced_bag_temporary_data,
-    create_bag_from_image_folder_and_poses,
-    ensure_bag_image_pose_timestamps_synchronized,
-    read_current_session_start_image_timestamp_nsec,
+    compute_bag_image_pose_timestamp_sync,
+    compute_folder_image_pose_timestamp_sync,
+    read_bag_start_image_timestamp_nsec,
+    read_folder_start_image_timestamp_nsec,
 )
 from scarf_slam.integrations.slam_bag import (
     DEFAULT_FINAL_TRAJECTORY_TOPIC,
@@ -75,6 +75,7 @@ from scarf_slam.integrations.slam_bag import (
     DEFAULT_ODOMETRY_TOPIC,
     DEFAULT_TRAJECTORY_TOPIC,
     load_slam_bag,
+    load_image_folder_and_poses,
 )
 from scarf_slam.integrations import ros2_publishing
 from scarf_slam.integrations.ros2_publishing import (
@@ -170,7 +171,6 @@ class ScaRFSLAM():
         self.ros2_images_topic = "/scarf_slam/images"
         self.slam_bag_data = None
         self.timestamp_sync_result = None
-        self.timestamp_sync_tmp_root = None
         self.is_mono = False
         self.fixed_mono_trajectory_scale: Optional[float] = None
 
@@ -1577,26 +1577,18 @@ class ScaRFSLAM():
         timestamp_tolerance_sec = float(
             self.config.get("image_pose_timestamp_tolerance_sec", 0.005)
         )
-        timestamp_sync_tmp_root = Path(self.slam_folder).expanduser().parent / "tmp"
-        self.timestamp_sync_tmp_root = timestamp_sync_tmp_root
-        cleanup_synced_bag_temporary_data(timestamp_sync_tmp_root)
-        input_bag_for_sync = self.input_bag
-        if using_file_input:
-            input_bag_for_sync = create_bag_from_image_folder_and_poses(
-                image_folder=self.image_folder,
-                poses_path=self.poses,
-                image_topic=slam_image_topic,
-                poses_topic=slam_final_trajectory_topic,
-                tmp_root=timestamp_sync_tmp_root,
-                frame_id=self.config.get("ros2_pointcloud_frame_id", "map"),
-            )
 
         previous_image_timestamps_nsec: Set[int] = set()
         if self.prev_slam_folder is not None:
-            current_session_start_nsec = read_current_session_start_image_timestamp_nsec(
-                input_bag_for_sync,
-                image_topic=slam_image_topic,
-            )
+            if using_file_input:
+                current_session_start_nsec = read_folder_start_image_timestamp_nsec(
+                    self.image_folder
+                )
+            else:
+                current_session_start_nsec = read_bag_start_image_timestamp_nsec(
+                    self.input_bag,
+                    image_topic=slam_image_topic,
+                )
             (
                 previous_image_timestamps_nsec,
                 previous_data_timestamps_nsec,
@@ -1610,16 +1602,23 @@ class ScaRFSLAM():
                 f"timestamps={len(previous_image_timestamps_nsec)}"
             )
 
-        sync_result = ensure_bag_image_pose_timestamps_synchronized(
-            input_bag_for_sync,
-            image_topic=slam_image_topic,
-            trajectory_topic=slam_trajectory_topic,
-            final_trajectory_topic=slam_final_trajectory_topic,
-            odometry_topic=slam_odometry_topic,
-            tolerance_sec=timestamp_tolerance_sec,
-            tmp_root=timestamp_sync_tmp_root,
-            extra_image_timestamps_nsec=previous_image_timestamps_nsec,
-        )
+        if using_file_input:
+            sync_result = compute_folder_image_pose_timestamp_sync(
+                self.image_folder,
+                self.poses,
+                tolerance_sec=timestamp_tolerance_sec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
+            )
+        else:
+            sync_result = compute_bag_image_pose_timestamp_sync(
+                self.input_bag,
+                image_topic=slam_image_topic,
+                trajectory_topic=slam_trajectory_topic,
+                final_trajectory_topic=slam_final_trajectory_topic,
+                odometry_topic=slam_odometry_topic,
+                tolerance_sec=timestamp_tolerance_sec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
+            )
         self.timestamp_sync_result = sync_result
         print(
             "Image/pose timestamp sync: "
@@ -1653,21 +1652,29 @@ class ScaRFSLAM():
                 f"{sync_result.previous_session_skipped_pose_timestamps}"
                 f"{ANSI_RESET}"
             )
-        if sync_result.synchronized:
-            print(f"Using synchronized input bag: {sync_result.bag_path}")
-        self.input_bag = str(sync_result.bag_path)
+        pose_timestamp_map = sync_result.timestamp_map if sync_result.sync_applied else None
+        if sync_result.sync_applied:
+            print(f"Applying in-memory timestamp sync while loading: {sync_result.bag_path}")
         sync_start_timestamp_nsec = sync_result.current_session_start_image_timestamp_nsec
         if sync_start_timestamp_nsec is not None:
             self.session_start_time = timestamp_nsec_to_key(sync_start_timestamp_nsec)
 
-        self.slam_bag_data = load_slam_bag(
-            self.input_bag,
-            use_slam=use_slam,
-            trajectory_topic=slam_trajectory_topic,
-            final_trajectory_topic=slam_final_trajectory_topic,
-            odometry_topic=slam_odometry_topic,
-            image_topic=slam_image_topic,
-        )
+        if using_file_input:
+            self.slam_bag_data = load_image_folder_and_poses(
+                self.image_folder,
+                self.poses,
+                pose_timestamp_map=pose_timestamp_map,
+            )
+        else:
+            self.slam_bag_data = load_slam_bag(
+                self.input_bag,
+                use_slam=use_slam,
+                trajectory_topic=slam_trajectory_topic,
+                final_trajectory_topic=slam_final_trajectory_topic,
+                odometry_topic=slam_odometry_topic,
+                image_topic=slam_image_topic,
+                pose_timestamp_map=pose_timestamp_map,
+            )
         current_session_timestamps = set(self.slam_bag_data.compressed_images)
         if sync_start_timestamp_nsec is None:
             self.session_start_time = min(current_session_timestamps)
@@ -1781,6 +1788,14 @@ class ScaRFSLAM():
         if self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
             self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
+            if self.config.get("torch_compile", False):
+                # Compile only when requested; warmup batches are slower.
+                compile_mode = self.config.get("torch_compile_mode", "default")
+                print(
+                    f"[scarf] torch.compile depth model (mode={compile_mode}); "
+                    "expect slow warmup batches while compiling"
+                )
+                self.model.model = torch.compile(self.model.model, mode=compile_mode)
         else:
             raise ValueError(f"Invalid self.model_name: {self.model_name}")
 
@@ -2540,7 +2555,7 @@ class ScaRFSLAM():
             "schema_version": 1,
             "description": "ScaRF-SLAM global optimization graph artifact.",
             "slam_folder": str(self.slam_folder),
-            "input_bag": str(self.input_bag),
+            "input_bag": str(self.input_bag) if self.input_bag is not None else None,
             "prev_slam_folder": str(self.prev_slam_folder) if self.prev_slam_folder is not None else None,
             "model_name": getattr(self, "model_name", None),
             "current_traj_timestamp": self.current_traj_timestamp,
@@ -2636,7 +2651,7 @@ class ScaRFSLAM():
             recon_dir = Path(self.slam_folder) / "recon" / self.recon_save_folder_name
             recon_dir.mkdir(parents=True, exist_ok=True)
             o3d.io.write_point_cloud(
-                str(recon_dir / f"pts_global{suffix}.pcd"), pcd_global
+                str(recon_dir / f"pts_global{suffix}.pcd"), pcd_global, compressed=True
             )
 
 
@@ -2695,7 +2710,7 @@ class ScaRFSLAM():
                 pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
                 pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
                 pcd_path = output_dir / f"cloud_{frame_key}.pcd"
-                o3d.io.write_point_cloud(str(pcd_path), pcd)
+                o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
                 poses_tum_dict[frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)
@@ -2751,7 +2766,7 @@ class ScaRFSLAM():
 
             sec_str, nsec_str = last_frame_key.split("_")
             pcd_path = output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.pcd"
-            o3d.io.write_point_cloud(str(pcd_path), pcd)
+            o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
             poses_tum_dict[last_frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)
@@ -2825,8 +2840,6 @@ def main(args=None):
         app.app_configure(parsed_args.config)
         app.do_processing_outer()
     finally:
-        if app.timestamp_sync_tmp_root is not None:
-            cleanup_synced_bag_temporary_data(app.timestamp_sync_tmp_root)
         if app.ros2_node is not None:
             app.ros2_node.destroy_node()
         if rclpy is not None and rclpy.ok():

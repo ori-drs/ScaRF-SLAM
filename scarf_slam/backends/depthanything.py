@@ -144,6 +144,11 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
             image=image_data_lst,
             intrinsics=intrinsics_array,
         )
+        raise NotImplementedError(
+            "Requires additional implementation to align the predicted depth scale "
+            "with the SLAM pose scale and to overwrite predictions.intrinsics and "
+            "predictions.extrinsics with the calibrated intrinsics and SLAM poses."
+        )
 
     # if torch.cuda.is_available():
     #     torch.cuda.synchronize()

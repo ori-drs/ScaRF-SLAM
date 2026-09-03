@@ -1,4 +1,6 @@
 model_name: da
+torch_compile: false
+torch_compile_mode: default
 
 use_slam: false
 is_mono: true

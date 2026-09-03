@@ -1,3 +1,4 @@
+import contextlib
 import os
 import time
 import numpy as np
@@ -5,6 +6,19 @@ import cv2
 from typing import Dict, List, Tuple, Optional, Any
 
 _VISMATCH_MATCHER_CACHE: Dict[Tuple[str, str, int], Any] = {}
+
+
+def _inference_autocast(torch_module: Any, device: Any):
+    if os.environ.get("SCARF_MATCHER_AUTOCAST", "0") == "0":
+        return contextlib.nullcontext()
+    if not str(device).startswith("cuda") or not torch_module.cuda.is_available():
+        return contextlib.nullcontext()
+    dtype = (
+        torch_module.bfloat16
+        if torch_module.cuda.is_bf16_supported()
+        else torch_module.float16
+    )
+    return torch_module.autocast(device_type="cuda", dtype=dtype)
 
 
 def _frame_to_vismatch_input(img: np.ndarray) -> np.ndarray:
@@ -33,6 +47,9 @@ def _to_numpy_safe(x: Any) -> Any:
     if isinstance(x, tuple):
         return tuple(_to_numpy_safe(v) for v in x)
     if torch is not None and isinstance(x, torch.Tensor):
+        if x.dtype in (torch.bfloat16, torch.float16):
+            # numpy has no bfloat16; autocast outputs come back as float32
+            x = x.float()
         return x.detach().cpu().numpy()
     return x
 
@@ -79,7 +96,7 @@ def _extract_vismatch_frame_feature(
 ) -> Dict[str, Any]:
     matcher_img = _frame_to_vismatch_input(image)
     matcher_img_tensor = to_tensor_image(matcher_img).to(matcher.device)
-    with torch_module.inference_mode():
+    with torch_module.inference_mode(), _inference_autocast(torch_module, matcher.device):
         feats = matcher.extractor.extract(matcher_img_tensor)
     keypoint_coords = _to_numpy_safe(feats["keypoints"])[0].astype(np.float32, copy=False)
     return {
@@ -502,7 +519,7 @@ def extract_feat_and_match_dl(
             if projected_inside < 5:
                 continue
 
-            with torch.inference_mode():
+            with torch.inference_mode(), _inference_autocast(torch, matcher.device):
                 pred = matcher.matcher(
                     {
                         "image0": matcher_feats[cur_idx],
@@ -725,7 +742,7 @@ def verify_frame_pair_match_dl(
         feats_1 = frame_feature_1["feats"]
         keypoints_1 = np.asarray(frame_feature_1["keypoint_coords"], dtype=np.float32)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), _inference_autocast(torch, matcher.device):
         pred = matcher.matcher(
             {
                 "image0": feats_0,
