@@ -55,14 +55,17 @@ def _path_msg_to_pose_dict(path_msg) -> Dict[str, MappingPose]:
     }
 
 
+def _path_msg_snapshot_key(path_msg) -> str:
+    if path_msg.poses:
+        return _stamp_key(path_msg.poses[-1].header.stamp)
+    return _stamp_key(path_msg.header.stamp)
+
+
 def _synced_path_snapshot(
     path_msg,
     timestamp_map: Mapping[int, int],
 ) -> Optional[Tuple[int, str, Dict[str, MappingPose]]]:
-    """Apply the pose→image timestamp map to a Path message: drop unmatched
-    poses, rewrite matched stamps, and restamp the header from the last matched
-    pose. Returns None when no pose matches (such a message would previously
-    have been dropped from the synced bag)."""
+    """Return a loaded Path snapshot with pose timestamps mapped to image time."""
     pose_timestamps_nsec = [
         _stamp_to_nsec(pose_stamped.header.stamp) for pose_stamped in path_msg.poses
     ]
@@ -208,7 +211,7 @@ def load_slam_bag(
             msg = reader.deserialize(rawdata, connection.msgtype)
             if connection.topic == trajectory_topic:
                 if pose_timestamp_map is None:
-                    trajectory_snapshots[_stamp_key(msg.header.stamp)] = _path_msg_to_pose_dict(msg)
+                    trajectory_snapshots[_path_msg_snapshot_key(msg)] = _path_msg_to_pose_dict(msg)
                 else:
                     snapshot = _synced_path_snapshot(msg, pose_timestamp_map)
                     if snapshot is not None:
@@ -216,11 +219,9 @@ def load_slam_bag(
             elif connection.topic == final_trajectory_topic:
                 if pose_timestamp_map is None:
                     final_trajectory_snapshots.append(
-                        (int(timestamp), _stamp_key(msg.header.stamp), _path_msg_to_pose_dict(msg))
+                        (int(timestamp), _path_msg_snapshot_key(msg), _path_msg_to_pose_dict(msg))
                     )
                 else:
-                    # Order final snapshots by the rewritten header stamp, matching
-                    # the write timestamps the synced bag used to carry.
                     snapshot = _synced_path_snapshot(msg, pose_timestamp_map)
                     if snapshot is not None:
                         final_trajectory_snapshots.append(snapshot)
@@ -270,16 +271,13 @@ def load_slam_bag(
     )
 
 
-def load_slam_data_from_image_folder_and_poses(
+def load_image_folder_and_poses(
     image_folder: str | Path,
     poses_path: str | Path,
     *,
     pose_timestamp_map: Optional[Mapping[int, int]] = None,
 ) -> SlamBagData:
-    """Build SlamBagData directly from an image folder and a pose file
-    (--image_folder/--poses input, use_slam: false), without writing a
-    temporary bag. The pose file acts as the single final-trajectory snapshot,
-    stamped at the last matched pose."""
+    """Load image-folder and pose-file input."""
     resolved_image_folder = Path(image_folder).expanduser()
     image_files = _collect_image_files(resolved_image_folder)
     poses = read_pose_file(poses_path)

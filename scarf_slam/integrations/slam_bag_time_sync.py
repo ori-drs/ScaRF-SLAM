@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import io
 import re
-import shutil
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +14,6 @@ import numpy as np
 PATH_MSG_TYPE = "nav_msgs/msg/Path"
 ODOMETRY_MSG_TYPE = "nav_msgs/msg/Odometry"
 COMPRESSED_IMAGE_MSG_TYPE = "sensor_msgs/msg/CompressedImage"
-SYNCED_BAGS_DIRNAME = "synced_bags"
 IMAGE_FILENAME_RE = re.compile(r"^image_(\d+)_(\d+)(?:\.[^.]+)?$")
 
 PoseRow = Tuple[int, int, float, float, float, float, float, float, float]
@@ -24,7 +22,7 @@ PoseRow = Tuple[int, int, float, float, float, float, float, float, float]
 @dataclass(frozen=True)
 class BagTimestampSyncResult:
     bag_path: Path
-    synchronized: bool
+    sync_applied: bool
     unique_pose_timestamps: int
     exact_matches: int
     rewritten_timestamps: int
@@ -159,15 +157,7 @@ def _count_path_header_updates(
     )
 
 
-def cleanup_synced_bag_temporary_data(tmp_root: str | Path) -> None:
-    # Kept for cleaning up caches written by older versions of the pipeline;
-    # the current pipeline no longer writes synced bags.
-    synced_bags_dir = Path(tmp_root).expanduser() / SYNCED_BAGS_DIRNAME
-    if synced_bags_dir.exists():
-        shutil.rmtree(synced_bags_dir)
-
-
-def read_current_session_start_image_timestamp_nsec(
+def read_bag_start_image_timestamp_nsec(
     input_bag: str | Path,
     *,
     image_topic: Optional[str],
@@ -224,7 +214,7 @@ def read_current_session_start_image_timestamp_nsec(
     )
 
 
-def read_image_folder_start_timestamp_nsec(image_folder: str | Path) -> int:
+def read_folder_start_image_timestamp_nsec(image_folder: str | Path) -> int:
     return _collect_image_files(image_folder)[0][0]
 
 
@@ -346,10 +336,10 @@ def _build_sync_result(
     pose_timestamps_nsec: Set[int],
     path_message_timestamps_nsec: List[Tuple[int, List[int]]],
     tolerance_sec: float,
-    extra_image_timestamps_nsec_set: Set[int],
+    previous_session_image_timestamps_nsec_set: Set[int],
 ) -> BagTimestampSyncResult:
     tolerance_nsec = int(round(float(tolerance_sec) * 1_000_000_000))
-    all_image_timestamps_nsec = image_timestamps_nsec | extra_image_timestamps_nsec_set
+    all_image_timestamps_nsec = image_timestamps_nsec | previous_session_image_timestamps_nsec_set
     timestamp_map, deltas_nsec = _match_pose_timestamps_to_images(
         pose_timestamps_nsec,
         all_image_timestamps_nsec,
@@ -357,9 +347,9 @@ def _build_sync_result(
     )
     _ensure_unique_image_matches(timestamp_map)
 
-    matched_previous_image_timestamps_nsec = set(timestamp_map.values()) & extra_image_timestamps_nsec_set
+    matched_previous_image_timestamps_nsec = set(timestamp_map.values()) & previous_session_image_timestamps_nsec_set
     missing_previous_image_timestamps_nsec = sorted(
-        extra_image_timestamps_nsec_set - matched_previous_image_timestamps_nsec
+        previous_session_image_timestamps_nsec_set - matched_previous_image_timestamps_nsec
     )
     if missing_previous_image_timestamps_nsec:
         preview = ", ".join(
@@ -378,13 +368,32 @@ def _build_sync_result(
     skipped_pose_timestamps_nsec = pose_timestamps_nsec - set(timestamp_map)
     skipped_pose_timestamps = len(skipped_pose_timestamps_nsec)
     current_session_start_image_timestamp_nsec = min(image_timestamps_nsec)
+    current_session_skipped_pose_timestamps_nsec = sorted(
+        pose_nsec
+        for pose_nsec in skipped_pose_timestamps_nsec
+        if (
+            not previous_session_image_timestamps_nsec_set
+            or pose_nsec >= current_session_start_image_timestamp_nsec
+        )
+    )
+    if current_session_skipped_pose_timestamps_nsec:
+        preview = ", ".join(
+            _timestamp_nsec_key(timestamp_nsec)
+            for timestamp_nsec in current_session_skipped_pose_timestamps_nsec[:10]
+        )
+        suffix = "..." if len(current_session_skipped_pose_timestamps_nsec) > 10 else ""
+        raise ValueError(
+            "Current-session pose timestamp(s) have no matching image within "
+            f"{tolerance_sec:.9f}s: count={len(current_session_skipped_pose_timestamps_nsec)}, "
+            f"first={preview}{suffix}"
+        )
     previous_session_skipped_pose_timestamps = (
         sum(
             1
             for pose_nsec in skipped_pose_timestamps_nsec
             if pose_nsec < current_session_start_image_timestamp_nsec
         )
-        if extra_image_timestamps_nsec_set
+        if previous_session_image_timestamps_nsec_set
         else 0
     )
     current_session_skipped_pose_timestamps = (
@@ -395,14 +404,14 @@ def _build_sync_result(
         timestamp_map,
     )
     max_delta_sec = (max(deltas_nsec) * 1e-9) if deltas_nsec else 0.0
-    synchronized = not (
+    sync_applied = not (
         rewritten_timestamps == 0
         and path_header_updates == 0
         and current_session_skipped_pose_timestamps == 0
     )
     return BagTimestampSyncResult(
         bag_path=source_path,
-        synchronized=synchronized,
+        sync_applied=sync_applied,
         unique_pose_timestamps=len(timestamp_map),
         exact_matches=exact_matches,
         rewritten_timestamps=rewritten_timestamps,
@@ -424,12 +433,8 @@ def compute_bag_image_pose_timestamp_sync(
     final_trajectory_topic: Optional[str],
     odometry_topic: Optional[str],
     tolerance_sec: float,
-    extra_image_timestamps_nsec: Iterable[int] = (),
+    previous_session_image_timestamps_nsec: Iterable[int] = (),
 ) -> BagTimestampSyncResult:
-    """Scan the bag once and compute the pose→image timestamp map.
-
-    Nothing is written to disk; the map is applied in memory by load_slam_bag.
-    """
     if image_topic is None:
         raise ValueError("slam_image_topic must not be null")
     if tolerance_sec < 0:
@@ -447,9 +452,9 @@ def compute_bag_image_pose_timestamp_sync(
     if not resolved_input_bag.exists():
         raise FileNotFoundError(f"Input bag was not found: {resolved_input_bag}")
 
-    extra_image_timestamps_nsec_set = {
+    previous_session_image_timestamps_nsec_set = {
         int(timestamp_nsec)
-        for timestamp_nsec in extra_image_timestamps_nsec
+        for timestamp_nsec in previous_session_image_timestamps_nsec
     }
     path_topics, odometry_topics = _selected_pose_topics(
         trajectory_topic=trajectory_topic,
@@ -530,24 +535,17 @@ def compute_bag_image_pose_timestamp_sync(
         pose_timestamps_nsec=pose_timestamps_nsec,
         path_message_timestamps_nsec=path_message_timestamps_nsec,
         tolerance_sec=tolerance_sec,
-        extra_image_timestamps_nsec_set=extra_image_timestamps_nsec_set,
+        previous_session_image_timestamps_nsec_set=previous_session_image_timestamps_nsec_set,
     )
 
 
-def compute_image_folder_pose_timestamp_sync(
+def compute_folder_image_pose_timestamp_sync(
     image_folder: str | Path,
     poses_path: str | Path,
     *,
     tolerance_sec: float,
-    extra_image_timestamps_nsec: Iterable[int] = (),
+    previous_session_image_timestamps_nsec: Iterable[int] = (),
 ) -> BagTimestampSyncResult:
-    """Compute the pose→image timestamp map for --image_folder/--poses input.
-
-    Timestamps come from the image filenames and the pose file; no temporary
-    bag is created. The pose file is treated as a single trajectory snapshot
-    stamped at the last pose, mirroring the Path message the pipeline used to
-    write into a temporary bag.
-    """
     if tolerance_sec < 0:
         raise ValueError(f"image_pose_timestamp_tolerance_sec must be non-negative, got {tolerance_sec}")
 
@@ -565,7 +563,7 @@ def compute_image_folder_pose_timestamp_sync(
         pose_timestamps_nsec=set(pose_timestamps_list),
         path_message_timestamps_nsec=[(last_pose_nsec, pose_timestamps_list)],
         tolerance_sec=tolerance_sec,
-        extra_image_timestamps_nsec_set={
-            int(timestamp_nsec) for timestamp_nsec in extra_image_timestamps_nsec
+        previous_session_image_timestamps_nsec_set={
+            int(timestamp_nsec) for timestamp_nsec in previous_session_image_timestamps_nsec
         },
     )

@@ -9,12 +9,7 @@ _VISMATCH_MATCHER_CACHE: Dict[Tuple[str, str, int], Any] = {}
 
 
 def _inference_autocast(torch_module: Any, device: Any):
-    """Mixed-precision context for deep extractor/matcher forwards on CUDA
-    (bf16 when supported, else fp16); disabled via SCARF_MATCHER_AUTOCAST=0.
-    Deliberately a no-op on CPU: CPU autocast covers more ops than CUDA's, so
-    a bf16 tensor reaches kornia's rgb_to_grayscale inside SuperPoint, which
-    rejects bf16."""
-    if os.environ.get("SCARF_MATCHER_AUTOCAST", "1") == "0":
+    if os.environ.get("SCARF_MATCHER_AUTOCAST", "0") == "0":
         return contextlib.nullcontext()
     if not str(device).startswith("cuda") or not torch_module.cuda.is_available():
         return contextlib.nullcontext()

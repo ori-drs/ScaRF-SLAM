@@ -64,11 +64,10 @@ from scarf_slam.utils.timestamp_ops import (
 )
 from scarf_slam.utils import keyframe_selection
 from scarf_slam.integrations.slam_bag_time_sync import (
-    cleanup_synced_bag_temporary_data,
     compute_bag_image_pose_timestamp_sync,
-    compute_image_folder_pose_timestamp_sync,
-    read_current_session_start_image_timestamp_nsec,
-    read_image_folder_start_timestamp_nsec,
+    compute_folder_image_pose_timestamp_sync,
+    read_bag_start_image_timestamp_nsec,
+    read_folder_start_image_timestamp_nsec,
 )
 from scarf_slam.integrations.slam_bag import (
     DEFAULT_FINAL_TRAJECTORY_TOPIC,
@@ -76,7 +75,7 @@ from scarf_slam.integrations.slam_bag import (
     DEFAULT_ODOMETRY_TOPIC,
     DEFAULT_TRAJECTORY_TOPIC,
     load_slam_bag,
-    load_slam_data_from_image_folder_and_poses,
+    load_image_folder_and_poses,
 )
 from scarf_slam.integrations import ros2_publishing
 from scarf_slam.integrations.ros2_publishing import (
@@ -172,7 +171,6 @@ class ScaRFSLAM():
         self.ros2_images_topic = "/scarf_slam/images"
         self.slam_bag_data = None
         self.timestamp_sync_result = None
-        self.timestamp_sync_tmp_root = None
         self.is_mono = False
         self.fixed_mono_trajectory_scale: Optional[float] = None
 
@@ -1579,20 +1577,15 @@ class ScaRFSLAM():
         timestamp_tolerance_sec = float(
             self.config.get("image_pose_timestamp_tolerance_sec", 0.005)
         )
-        timestamp_sync_tmp_root = Path(self.slam_folder).expanduser().parent / "tmp"
-        self.timestamp_sync_tmp_root = timestamp_sync_tmp_root
-        # Timestamp sync is applied in memory; this only removes synced-bag
-        # caches left behind by older versions of the pipeline.
-        cleanup_synced_bag_temporary_data(timestamp_sync_tmp_root)
 
         previous_image_timestamps_nsec: Set[int] = set()
         if self.prev_slam_folder is not None:
             if using_file_input:
-                current_session_start_nsec = read_image_folder_start_timestamp_nsec(
+                current_session_start_nsec = read_folder_start_image_timestamp_nsec(
                     self.image_folder
                 )
             else:
-                current_session_start_nsec = read_current_session_start_image_timestamp_nsec(
+                current_session_start_nsec = read_bag_start_image_timestamp_nsec(
                     self.input_bag,
                     image_topic=slam_image_topic,
                 )
@@ -1610,11 +1603,11 @@ class ScaRFSLAM():
             )
 
         if using_file_input:
-            sync_result = compute_image_folder_pose_timestamp_sync(
+            sync_result = compute_folder_image_pose_timestamp_sync(
                 self.image_folder,
                 self.poses,
                 tolerance_sec=timestamp_tolerance_sec,
-                extra_image_timestamps_nsec=previous_image_timestamps_nsec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
             )
         else:
             sync_result = compute_bag_image_pose_timestamp_sync(
@@ -1624,7 +1617,7 @@ class ScaRFSLAM():
                 final_trajectory_topic=slam_final_trajectory_topic,
                 odometry_topic=slam_odometry_topic,
                 tolerance_sec=timestamp_tolerance_sec,
-                extra_image_timestamps_nsec=previous_image_timestamps_nsec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
             )
         self.timestamp_sync_result = sync_result
         print(
@@ -1659,15 +1652,15 @@ class ScaRFSLAM():
                 f"{sync_result.previous_session_skipped_pose_timestamps}"
                 f"{ANSI_RESET}"
             )
-        pose_timestamp_map = sync_result.timestamp_map if sync_result.synchronized else None
-        if sync_result.synchronized:
+        pose_timestamp_map = sync_result.timestamp_map if sync_result.sync_applied else None
+        if sync_result.sync_applied:
             print(f"Applying in-memory timestamp sync while loading: {sync_result.bag_path}")
         sync_start_timestamp_nsec = sync_result.current_session_start_image_timestamp_nsec
         if sync_start_timestamp_nsec is not None:
             self.session_start_time = timestamp_nsec_to_key(sync_start_timestamp_nsec)
 
         if using_file_input:
-            self.slam_bag_data = load_slam_data_from_image_folder_and_poses(
+            self.slam_bag_data = load_image_folder_and_poses(
                 self.image_folder,
                 self.poses,
                 pose_timestamp_map=pose_timestamp_map,
@@ -1796,8 +1789,7 @@ class ScaRFSLAM():
             from depth_anything_3.api import DepthAnything3
             self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
             if self.config.get("torch_compile", False):
-                # "reduce-overhead" adds CUDA graphs on top; only worth it if a
-                # profile shows kernel-launch gaps, and it needs stable batch shapes.
+                # Compile only when requested; warmup batches are slower.
                 compile_mode = self.config.get("torch_compile_mode", "default")
                 print(
                     f"[scarf] torch.compile depth model (mode={compile_mode}); "
@@ -1932,7 +1924,7 @@ class ScaRFSLAM():
                     ref_ts_sub, 
                     self.in_ref_poses_dict,
                     self.ph_views_per_batch,
-                    use_extrinsics=("MONO" not in str(self.config.get("da3_model", ""))),
+                    use_extrinsics=True,
                 )
                 predictions, ph_view_poses_sub, new_ph_to_ref_dict = da_out
             else:
@@ -2848,8 +2840,6 @@ def main(args=None):
         app.app_configure(parsed_args.config)
         app.do_processing_outer()
     finally:
-        if app.timestamp_sync_tmp_root is not None:
-            cleanup_synced_bag_temporary_data(app.timestamp_sync_tmp_root)
         if app.ros2_node is not None:
             app.ros2_node.destroy_node()
         if rclpy is not None and rclpy.ok():
