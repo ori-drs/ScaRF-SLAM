@@ -133,13 +133,27 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
     #     log_cuda_memory("before inference")
 
     if use_extrinsics:
-        predictions = app.model.inference(
+        _inf = lambda: app.model.inference(
             image=image_data_lst,
             extrinsics=np.stack(extrinsics_lst, axis=0).astype(np.float32),
             intrinsics=intrinsics_array,
             align_to_input_ext_scale=True,
             ref_view_strategy="saddle_balanced",
         )
+        try:
+            predictions = _inf()
+        except Exception as e:
+            # DA3 fits its depth scale to the input poses with RANSAC once a batch has >= 10 views, and the final refit on the
+            # best inliers is unguarded: with several views per keyframe (pinhole_views_yaw) the inliers can be views sharing one
+            # camera centre, and evo's Umeyama raises. Retry this batch with the plain Umeyama fit over all views (2026-10-25).
+            import functools
+            print(f"DA3 pose alignment failed ({type(e).__name__}: {e}); retrying this batch without RANSAC", flush=True)
+            _orig = app.model._align_to_input_extrinsics_intrinsics
+            app.model._align_to_input_extrinsics_intrinsics = functools.partial(_orig, ransac_view_thresh=10**9)
+            try:
+                predictions = _inf()
+            finally:
+                app.model._align_to_input_extrinsics_intrinsics = _orig
     else:
         predictions = app.model.inference(
             image=image_data_lst,
