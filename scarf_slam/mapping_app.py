@@ -68,6 +68,7 @@ from scarf_slam.utils import keyframe_selection
 from scarf_slam.integrations.slam_bag_time_sync import (
     compute_bag_image_pose_timestamp_sync,
     compute_folder_image_pose_timestamp_sync,
+    compute_bag_images_pose_file_sync,
     read_bag_start_image_timestamp_nsec,
     read_folder_start_image_timestamp_nsec,
 )
@@ -78,6 +79,7 @@ from scarf_slam.integrations.slam_bag import (
     DEFAULT_TRAJECTORY_TOPIC,
     load_slam_bag,
     load_image_folder_and_poses,
+    load_bag_images_and_poses,
 )
 from scarf_slam.integrations import ros2_publishing
 from scarf_slam.integrations.ros2_publishing import (
@@ -1446,7 +1448,7 @@ class ScaRFSLAM():
             iters=30,
             max_points_per_overlap_frame=max_points_per_overlap_frame,
             robust_delta=0.1,
-            reg_weight=0.01,
+            reg_weight=float(os.environ.get("SCARF_PERIODIC_REG", 0.01)),   # windowed (periodic) solve: pull toward 1; default as before
             normalize_mean=False,
             use_exp_param=True,
             random_seed=0,
@@ -1465,6 +1467,14 @@ class ScaRFSLAM():
 
 
     def _filter_prediction_confidence(self, predictions, conf_thresh_percentile: float):
+        if self.config.get("mask_black_pixels", False) and getattr(predictions, "processed_images", None) is not None:
+            # rotated views reach past the fisheye circle: the rectifier fills those pixels with 0, so they carry no image
+            # and must not become points (conf 0 = dropped by fusion and by the hook readers)
+            black = np.asarray(predictions.processed_images).max(axis=-1) <= 4
+            if black.shape == np.asarray(predictions.conf).shape:
+                predictions.conf = np.where(black, 0, predictions.conf)
+                predictions.depth = np.where(black, 0, predictions.depth)
+                print(f"Black-pixel mask removed {int(np.count_nonzero(black))} pixels outside the fisheye image.")
         prediction_sky = getattr(predictions, "sky", None)
         if prediction_sky is not None:
             sky_mask = np.asarray(prediction_sky).astype(bool)
@@ -1589,15 +1599,19 @@ class ScaRFSLAM():
 
         # --- load trajectories and image timestamps ---
         use_slam = bool(self.config.get("use_slam"))
-        using_file_input = self.image_folder is not None or self.poses is not None
+        # input modes: bag (images + trajectory topics), image folder + pose file, or bag images + pose file (2026-10-01:
+        # --input_bag with --poses and no --image_folder; frames read from the mcap on demand, poses interpolated at them)
+        bag_pose_file_input = self.input_bag is not None and self.poses is not None and self.image_folder is None
+        using_file_input = (self.image_folder is not None or self.poses is not None) and not bag_pose_file_input
         if self.input_bag is None and not using_file_input:
             raise ValueError("Either --input_bag or both --image_folder and --poses must be provided.")
         if self.input_bag is not None and using_file_input:
-            raise ValueError("--input_bag cannot be used together with --image_folder/--poses.")
+            raise ValueError("--input_bag cannot be used together with --image_folder (use --input_bag with --poses for bag images + pose file).")
         if using_file_input and (self.image_folder is None or self.poses is None):
             raise ValueError("--image_folder and --poses must be provided together.")
-        if using_file_input and use_slam:
-            raise ValueError("--image_folder/--poses input requires use_slam: false in the config.")
+        if (using_file_input or bag_pose_file_input) and use_slam:
+            raise ValueError("--image_folder/--poses and --input_bag/--poses input require use_slam: false in the config.")
+        bag_image_stride = int(self.config.get("bag_image_stride", 1))
 
         slam_odometry_topic = (
             self.config.get("slam_odometry_topic", DEFAULT_ODOMETRY_TOPIC)
@@ -1643,7 +1657,16 @@ class ScaRFSLAM():
                 f"timestamps={len(previous_image_timestamps_nsec)}"
             )
 
-        if using_file_input:
+        if bag_pose_file_input:
+            sync_result = compute_bag_images_pose_file_sync(
+                self.input_bag,
+                self.poses,
+                image_topic=slam_image_topic,
+                frame_stride=bag_image_stride,
+                tolerance_sec=timestamp_tolerance_sec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
+            )
+        elif using_file_input:
             sync_result = compute_folder_image_pose_timestamp_sync(
                 self.image_folder,
                 self.poses,
@@ -1700,7 +1723,15 @@ class ScaRFSLAM():
         if sync_start_timestamp_nsec is not None:
             self.session_start_time = timestamp_nsec_to_key(sync_start_timestamp_nsec)
 
-        if using_file_input:
+        if bag_pose_file_input:
+            self.slam_bag_data = load_bag_images_and_poses(
+                self.input_bag,
+                self.poses,
+                image_topic=slam_image_topic,
+                frame_stride=bag_image_stride,
+                pose_timestamp_map=pose_timestamp_map,
+            )
+        elif using_file_input:
             self.slam_bag_data = load_image_folder_and_poses(
                 self.image_folder,
                 self.poses,
@@ -1809,9 +1840,17 @@ class ScaRFSLAM():
             self.recon_save_folder_name = self.recon_save_folder_name + "_slam"
 
         # current implementation always assume using forward pinhole image.
-        self.ph_views_per_ref_pose = [
-            RotateParam(cam="cam0", yaw=0, pitch=0),
-        ]
+        # pinhole_view_yaw / pinhole_view_pitch (deg, default 0): one rotated virtual pinhole cut from the cam0 fisheye
+        # instead of the forward one (2026-10-25: side views of the Spot Insta360; the pose of each view is T_world_cam0 @ T_cam0_view)
+        # pinhole_views_yaw (list, deg): several views per keyframe, all fed to DA3 in the same batch (2026-10-25, Spot side views)
+        _yaws = self.config.get("pinhole_views_yaw")
+        if _yaws:
+            self.ph_views_per_ref_pose = [RotateParam(cam="cam0", yaw=float(y), pitch=float(self.config.get("pinhole_view_pitch", 0.0))) for y in _yaws]
+        else:
+            self.ph_views_per_ref_pose = [
+                RotateParam(cam="cam0", yaw=float(self.config.get("pinhole_view_yaw", 0.0)), pitch=float(self.config.get("pinhole_view_pitch", 0.0))),
+            ]
+        print(f"pinhole views per keyframe: {[(v.cam, v.yaw, v.pitch) for v in self.ph_views_per_ref_pose]}")
         self.ph_views_per_batch = [self.ph_views_per_ref_pose] * self.num_ref_poses_per_batch
         self.num_ph_views_per_ref_pose = len(self.ph_views_per_ref_pose)
         self.overlap_ph_views = self.overlap_ref_views * self.num_ph_views_per_ref_pose
@@ -1966,12 +2005,13 @@ class ScaRFSLAM():
                 self.save_out_poses_dict_to_csv(str(recon_dir / f"poses_{self.model_name}.csv"))
                 self.save_out_poses_ts_to_csv(str(recon_dir / f"poses_{self.model_name}_ts.csv"))
                 self.save_out_poses_dict_to_tum(str(recon_dir / f"poses_{self.model_name}.txt"))
-                final_step_start = time.perf_counter()
-                pts_global, colors_global = self._compose_global_pointcloud()
-                self._print_timing_line("Final Global Point Cloud Compose Time", time.perf_counter() - final_step_start)
-                final_step_start = time.perf_counter()
-                self.save_global_pointcloud(pts_global, colors_global, suffix=suffix)
-                self._print_timing_line("Final Global Point Cloud Save Time", time.perf_counter() - final_step_start)
+                if self.config.get("save_global_pointcloud", True):   # ScaRF's own fused cloud; consumers of the per-keyframe hook can skip it
+                    final_step_start = time.perf_counter()
+                    pts_global, colors_global = self._compose_global_pointcloud()
+                    self._print_timing_line("Final Global Point Cloud Compose Time", time.perf_counter() - final_step_start)
+                    final_step_start = time.perf_counter()
+                    self.save_global_pointcloud(pts_global, colors_global, suffix=suffix)
+                    self._print_timing_line("Final Global Point Cloud Save Time", time.perf_counter() - final_step_start)
                 if self.config.get("save_per_frame_local_pointclouds", True):
                     final_step_start = time.perf_counter()
                     self.save_per_frame_local_pointclouds(
@@ -2080,6 +2120,20 @@ class ScaRFSLAM():
             self._print_timing_line("Frame Scale Optimization Time", timing_info["frame_scale_opt_duration"], indent=0, color="\033[32m")
             self._print_timing_line("Submap Scale Optimization Time", timing_info["submap_scale_opt_duration"], indent=0, color="\033[32m")
             self._print_timing_line("Points Fusion Time", timing_info["pts_fusion_duration"], indent=0, color="\033[32m")
+            if os.environ.get("SCARF_BATCH_TIMING"):   # one JSON line per batch (2026-10-25 batch-size sweep): images, stage times, wall time, peak GPU memory
+                import json as _json
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _rec = {"batch": int(getattr(self, "_timing_batch_idx", 0)), "images": int(len(ph_view_poses_sub)), "keyframes": int(len(ref_ts_sub)),
+                        "inference_s": float(inference_duration), "match_s": float(timing_info["feature_match_duration"]),
+                        "frame_scale_s": float(timing_info["frame_scale_opt_duration"]), "submap_scale_s": float(timing_info["submap_scale_opt_duration"]),
+                        "fusion_s": float(timing_info["pts_fusion_duration"]), "wall_s": float(time.perf_counter() - inference_start_time),
+                        "peak_gpu_gb": float(torch.cuda.max_memory_allocated() / 2**30) if torch.cuda.is_available() else 0.0}
+                with open(os.environ["SCARF_BATCH_TIMING"], "a") as _f:
+                    _f.write(_json.dumps(_rec) + "\n")
+                self._timing_batch_idx = _rec["batch"] + 1
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
 
             header_timestamp = ph_view_poses_sub[-1][0]
             self._publish_sampled_global_pointcloud(header_timestamp=header_timestamp)
@@ -2113,7 +2167,7 @@ class ScaRFSLAM():
             feature_match_start_time = time.perf_counter()
             match_dict = feature_matching.extract_feat_and_match_dl(
                 predictions,
-                max_prev=5,
+                max_prev=int(self.config.get("frame_match_max_prev", 5)),   # images earlier in the batch list to match against (views x keyframes)
                 device=self.covisibility_graph.matcher_device,
                 matcher_name=self.vis_matcher,
                 rm_conf0_kpts=False,
@@ -2830,9 +2884,10 @@ def main(args=None):
     )
     parsed_args = parser.parse_args(args)
     using_bag_input = parsed_args.input_bag is not None
-    using_file_input = parsed_args.image_folder is not None or parsed_args.poses is not None
+    bag_pose_file_input = using_bag_input and parsed_args.poses is not None and parsed_args.image_folder is None
+    using_file_input = (parsed_args.image_folder is not None or parsed_args.poses is not None) and not bag_pose_file_input
     if using_bag_input == using_file_input:
-        parser.error("Pass either --input_bag or both --image_folder and --poses.")
+        parser.error("Pass --input_bag, or --image_folder with --poses, or --input_bag with --poses (bag images + pose file).")
     if using_file_input and (parsed_args.image_folder is None or parsed_args.poses is None):
         parser.error("--image_folder and --poses must be provided together.")
 

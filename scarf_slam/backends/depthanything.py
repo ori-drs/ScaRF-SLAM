@@ -95,7 +95,8 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
                     pinhole_intrinsics=app.pinhole_camera.intrinsics,
                     pinhole_resolution=app.pinhole_camera.resolution,
                     yaw=yaw,
-                    pitch=pitch
+                    pitch=pitch,
+                    max_theta_deg=app.config.get("fisheye_max_theta_deg"),
                 )
             else:
                 raise ValueError("Fisheye camera must use pinhole camera model with equidistant distortion")

@@ -32,8 +32,11 @@ def rectify_pinhole_equidistant_vectorized(
     pinhole_resolution,
     yaw=0.0,
     pitch=0.0,
-    roll=0.0
+    roll=0.0,
+    max_theta_deg=None
 ):
+    # max_theta_deg (2026-10-25): accept rays up to this angle off the fisheye axis instead of only Z > 0 (90 deg).
+    # The equidistant model is valid past 90 deg; the Spot Insta360 lens images up to ~109 deg, so side views fit inside it.
     if isinstance(pinhole_intrinsics, dict):
         fx_p = float(pinhole_intrinsics["fx"]); fy_p = float(pinhole_intrinsics["fy"])
         cx_p = float(pinhole_intrinsics["cx"]); cy_p = float(pinhole_intrinsics["cy"])
@@ -79,10 +82,10 @@ def rectify_pinhole_equidistant_vectorized(
     theta8 = theta4 * theta4
     theta_d = theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8)
     scale = np.zeros_like(theta_d)
-    valid = Z > 0.0
+    valid = Z > 0.0 if max_theta_deg is None else theta <= math.radians(float(max_theta_deg))
     nonzero_radius = valid & (r > 1e-12)
     scale[nonzero_radius] = theta_d[nonzero_radius] / r[nonzero_radius]
-    scale[(Z > 0.0) & (r <= 1e-12)] = 1.0
+    scale[valid & (r <= 1e-12)] = 1.0
 
     u_f = fx_f * X * scale + cx_f
     v_f = fy_f * Y * scale + cy_f
