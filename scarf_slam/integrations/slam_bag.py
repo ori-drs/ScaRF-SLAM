@@ -151,21 +151,45 @@ class SlamBagData:
                 f"Compressed image for {cam_name} at {timestamp} was not found in {self.bag_path}"
             )
         if timestamp not in self._decoded_images:
-            # cv2 (libjpeg-turbo) decodes the same pixels as imageio/Pillow for these JPEGs, ~1.6x faster (verified on the UniPark bags)
-            buf = np.frombuffer(self.compressed_images[timestamp], dtype=np.uint8)
-            img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-            if img is None:
-                img = np.asarray(imageio.imread(io.BytesIO(self.compressed_images[timestamp])))
-            elif img.ndim == 3 and img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            elif img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-            self._decoded_images[timestamp] = img
+            fut = self._prefetch_futs.pop(timestamp, None) if hasattr(self, "_prefetch_futs") else None
+            self._decoded_images[timestamp] = fut.result() if fut is not None else self._decode_bytes(timestamp)
             if self.image_cache_size:
                 while len(self._decoded_images) > self.image_cache_size: self._decoded_images.popitem(last=False)
         else:
             self._decoded_images.move_to_end(timestamp)
+        self._prefetch_after(timestamp)
         return self._decoded_images[timestamp]
+
+    def _decode_bytes(self, timestamp: str) -> np.ndarray:
+        # cv2 (libjpeg-turbo) decodes the same pixels as imageio/Pillow for these JPEGs, ~1.6x faster (verified on the UniPark bags)
+        buf = np.frombuffer(self.compressed_images[timestamp], dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            img = np.asarray(imageio.imread(io.BytesIO(self.compressed_images[timestamp])))
+        elif img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        return img
+
+    def _prefetch_after(self, timestamp: str) -> None:
+        """Decode the next SCARF_IMAGE_PREFETCH frames (time order) on a background thread (cv2 releases the GIL): the mapper walks
+        the frames in order, so the keyframes of the next batch are decoded while the current one is processed (2026-11-06)."""
+        n = int(os.environ.get("SCARF_IMAGE_PREFETCH", "0"))
+        if n <= 0: return
+        if not hasattr(self, "_prefetch_futs"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._prefetch_pool = ThreadPoolExecutor(2, thread_name_prefix="img_prefetch"); self._prefetch_futs = {}
+            self._ts_order = sorted(self.compressed_images); self._ts_index = {t: i for i, t in enumerate(self._ts_order)}
+        i = self._ts_index.get(timestamp)
+        if i is None: return
+        allowed = getattr(self, "prefetch_allowed", None)   # live semantics: a frame can only be decoded once it has been captured (set by a paced driver)
+        for t in self._ts_order[i + 1: i + 1 + n]:
+            if allowed is not None and not allowed(t): break
+            if t not in self._decoded_images and t not in self._prefetch_futs:
+                self._prefetch_futs[t] = self._prefetch_pool.submit(self._decode_bytes, t)
+        if len(self._prefetch_futs) > 4 * n:   # frames the mapper skipped (not keyframes): drop the oldest results
+            for t in list(self._prefetch_futs)[: len(self._prefetch_futs) - 2 * n]: self._prefetch_futs.pop(t)
 
 
 def load_slam_bag(

@@ -305,6 +305,12 @@ def _window_all_nonzero_map(conf_map: np.ndarray, radius: int) -> np.ndarray:
     _coord_has_nonzero_conf(nearby_size=r) computes per point), as one erosion of the nonzero mask."""
     nz = np.asarray(conf_map != 0, dtype=np.uint8)
     if radius > 0:
+        if os.environ.get("SCARF_WINDOW_TORCH", "0") == "1":
+            # the same erosion as a torch min-pool (max_pool2d pads with -inf, so the border behaves like cval=1), identical output,
+            # but measured 10x SLOWER than scipy at 504x378 (9.0 vs 0.9 ms, 2026-11-06): kept only as an A/B switch, off by default
+            import torch
+            t = torch.from_numpy(nz).to(torch.float32)[None, None]; r = int(radius)
+            return ((-torch.nn.functional.max_pool2d(-t, 2 * r + 1, stride=1, padding=r))[0, 0] > 0.5).numpy()
         from scipy.ndimage import minimum_filter
         nz = minimum_filter(nz, size=2 * int(radius) + 1, mode="constant", cval=1)
     return nz.astype(bool)
