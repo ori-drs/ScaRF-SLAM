@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--pcd",
         nargs="+",
         required=True,
-        help="One or more .pcd files to visualize in the same Open3D window.",
+        help="One or more .pcd or .ply files to visualize in the same Open3D window.",
     )
     parser.add_argument(
         "--point-size",

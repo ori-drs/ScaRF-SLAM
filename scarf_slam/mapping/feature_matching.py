@@ -96,8 +96,9 @@ def _extract_vismatch_frame_feature(
 ) -> Dict[str, Any]:
     matcher_img = _frame_to_vismatch_input(image)
     matcher_img_tensor = to_tensor_image(matcher_img).to(matcher.device)
+    _ext = getattr(matcher, "extractor", matcher)   # NN matchers (sift-nn/orb-nn) expose extract() directly
     with torch_module.inference_mode(), _inference_autocast(torch_module, matcher.device):
-        feats = matcher.extractor.extract(matcher_img_tensor)
+        feats = _ext.extract(matcher_img_tensor)
     keypoint_coords = _to_numpy_safe(feats["keypoints"])[0].astype(np.float32, copy=False)
     return {
         "feats": feats,
@@ -126,6 +127,12 @@ def _get_vismatch_matcher_cached(
             max_num_keypoints=int(max_num_keypoints),
         )
         matcher.skip_ransac = True
+        trt_dir = os.environ.get("SCARF_MATCHER_TRT")
+        if trt_dir and str(matcher_name) == "superpoint-lightglue" and str(device).startswith("cuda"):
+            # SuperPoint + LightGlue as TensorRT engines (scarf_slam/backends/superpoint_lightglue_trt.py); same extract()/matcher() contracts
+            from scarf_slam.backends.superpoint_lightglue_trt import SuperPointTrt, LightGlueTrt
+            matcher.extractor = SuperPointTrt(matcher.extractor, trt_dir)
+            matcher.matcher = LightGlueTrt(matcher.matcher, trt_dir, n_kpts=int(max_num_keypoints))
         _VISMATCH_MATCHER_CACHE[cache_key] = matcher
     return matcher
 
@@ -211,13 +218,14 @@ def _filter_zero_confidence_matches(
     if conf_0 is None and conf_1 is None:
         return matched_points_0, matched_points_1
 
+    # vectorised _coord_has_nonzero_conf over all matches: one erosion per confidence map instead of a window per point
     valid_mask = np.ones(len(matched_points_0), dtype=bool)
-    for i, (pt_0, pt_1) in enumerate(zip(matched_points_0, matched_points_1)):
-        if not _coord_has_nonzero_conf(conf_0, pt_0, nearby_size=nearby_size):
-            valid_mask[i] = False
+    for pts, cmap in ((matched_points_0, conf_0), (matched_points_1, conf_1)):
+        if cmap is None:
             continue
-        if not _coord_has_nonzero_conf(conf_1, pt_1, nearby_size=nearby_size):
-            valid_mask[i] = False
+        u_i, v_i, inside = _round_pixel_indices(np.asarray(pts, dtype=np.float32).reshape(-1, 2), cmap.shape)
+        win = _window_all_nonzero_map(cmap, int(nearby_size))
+        valid_mask &= inside & win[np.clip(v_i, 0, cmap.shape[0] - 1), np.clip(u_i, 0, cmap.shape[1] - 1)]
 
     return matched_points_0[valid_mask], matched_points_1[valid_mask]
 
@@ -258,6 +266,56 @@ def _project_kp_to_prev(
     return float(u_prev), float(v_prev)
 
 
+def _project_points_batch(
+    uv: np.ndarray,
+    depth: np.ndarray,
+    K_inv: np.ndarray,
+    T_c2w: np.ndarray,
+    K_prev: np.ndarray,
+    T_w2c_prev: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorised _project_kp_to_prev: uv (M,2), depth (M,) -> projected (M,2) float32 and a validity mask
+    (finite positive depth, positive depth in the previous camera). Same float32 arithmetic as the scalar version."""
+    uv = np.asarray(uv, dtype=np.float32).reshape(-1, 2)
+    depth = np.asarray(depth, dtype=np.float32).reshape(-1)
+    valid = np.isfinite(depth) & (depth > 0)
+    pix = np.concatenate([uv, np.ones((len(uv), 1), dtype=np.float32)], axis=1)
+    xyz_c = (pix @ K_inv.astype(np.float32).T) * depth[:, None]
+    xyz1 = np.concatenate([xyz_c, np.ones((len(uv), 1), dtype=np.float32)], axis=1)
+    xyz_w = xyz1 @ T_c2w.astype(np.float32).T
+    xyz_c_prev = (xyz_w @ T_w2c_prev.astype(np.float32).T)[:, :3]
+    valid &= xyz_c_prev[:, 2] > 0
+    uvw = xyz_c_prev @ K_prev.astype(np.float32).T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        proj = uvw[:, :2] / uvw[:, 2:3]
+    return proj, valid
+
+
+def _round_pixel_indices(uv: np.ndarray, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """int(round(.)) of (u, v) for every point (round-half-to-even like Python's round) and an in-bounds mask."""
+    h, w = shape[:2]
+    u_i = np.rint(np.asarray(uv[:, 0], dtype=np.float64)).astype(np.int64)
+    v_i = np.rint(np.asarray(uv[:, 1], dtype=np.float64)).astype(np.int64)
+    inside = (u_i >= 0) & (v_i >= 0) & (u_i < w) & (v_i < h)
+    return u_i, v_i, inside
+
+
+def _window_all_nonzero_map(conf_map: np.ndarray, radius: int) -> np.ndarray:
+    """Per-pixel `all(conf[v-r:v+r+1, u-r:u+r+1] != 0)` with the window clipped at the image border (what
+    _coord_has_nonzero_conf(nearby_size=r) computes per point), as one erosion of the nonzero mask."""
+    nz = np.asarray(conf_map != 0, dtype=np.uint8)
+    if radius > 0:
+        if os.environ.get("SCARF_WINDOW_TORCH", "0") == "1":
+            # the same erosion as a torch min-pool (max_pool2d pads with -inf, so the border behaves like cval=1), identical output,
+            # but measured 10x SLOWER than scipy at 504x378 (9.0 vs 0.9 ms, 2026-11-06): kept only as an A/B switch, off by default
+            import torch
+            t = torch.from_numpy(nz).to(torch.float32)[None, None]; r = int(radius)
+            return ((-torch.nn.functional.max_pool2d(-t, 2 * r + 1, stride=1, padding=r))[0, 0] > 0.5).numpy()
+        from scipy.ndimage import minimum_filter
+        nz = minimum_filter(nz, size=2 * int(radius) + 1, mode="constant", cval=1)
+    return nz.astype(bool)
+
+
 def _depth_at_point(depth_map: np.ndarray, u: float, v: float) -> Optional[float]:
     u_i = int(round(float(u)))
     v_i = int(round(float(v)))
@@ -265,6 +323,27 @@ def _depth_at_point(depth_map: np.ndarray, u: float, v: float) -> Optional[float
     if u_i < 0 or v_i < 0 or u_i >= w or v_i >= h:
         return None
     return float(depth_map[v_i, u_i])
+
+
+def _essential_inlier_mask(
+    pts0: np.ndarray,
+    pts1: np.ndarray,
+    k0: np.ndarray,
+    k1: np.ndarray,
+    threshold_px: float,
+) -> np.ndarray:
+    """Boolean inlier mask of the essential-matrix RANSAC of _essential_inlier_matches (all False when it fails)."""
+    n = len(pts0)
+    if n < 5 or len(pts1) < 5:
+        return np.zeros(n, dtype=bool)
+    pts0_norm = cv2.undistortPoints(pts0.reshape(-1, 1, 2).astype(np.float64), k0.astype(np.float64), None).reshape(-1, 2)
+    pts1_norm = cv2.undistortPoints(pts1.reshape(-1, 1, 2).astype(np.float64), k1.astype(np.float64), None).reshape(-1, 2)
+    mean_focal = float(0.25 * (float(k0[0, 0]) + float(k0[1, 1]) + float(k1[0, 0]) + float(k1[1, 1])))
+    threshold_norm = float(threshold_px) / max(mean_focal, 1e-9)
+    E, inlier_mask = cv2.findEssentialMat(pts0_norm, pts1_norm, focal=1.0, pp=(0.0, 0.0), method=cv2.RANSAC, prob=0.99, threshold=threshold_norm)
+    if E is None or inlier_mask is None:
+        return np.zeros(n, dtype=bool)
+    return inlier_mask.ravel().astype(bool)
 
 
 def _essential_inlier_matches(
@@ -374,6 +453,33 @@ def extract_feat_and_match_dl(
     n = imgs.shape[0]
     if n == 0:
         return {"keypoints": [], "matches": {}}
+    def _pair_ransac(p0, p1, K):
+        if len(p0) >= 8:
+            _, inl = cv2.findEssentialMat(p0, p1, np.asarray(K, np.float64),
+                                          method=cv2.USAC_MAGSAC, prob=0.999, threshold=ransac_reproj_thresh)
+            if inl is not None:
+                keep = inl.reshape(-1).astype(bool)
+                return p0[keep], p1[keep]
+        return p0, p1
+    if matcher_name.endswith("-nn"):   # one-shot classical matchers
+        from vismatch.utils import to_tensor_image as _tti
+        import torch as _t
+        m = _get_vismatch_matcher_cached(matcher_name=matcher_name, device=device, max_num_keypoints=max_num_keypoints)
+        kps = [[] for _ in range(n)]
+        matches = {}
+        tens = [_tti(_frame_to_vismatch_input(imgs[i])).to(m.device) for i in range(n)]
+        for i in range(n):
+            for j in range(max(0, i - max_prev), i):
+                with _t.inference_mode():
+                    out = m(tens[i], tens[j])
+                p0 = np.asarray(out["matched_kpts0"], np.float32).reshape(-1, 2)
+                p1 = np.asarray(out["matched_kpts1"], np.float32).reshape(-1, 2)
+                p0, p1 = _pair_ransac(p0, p1, intrinsics[i][:3, :3] if intrinsics[i].shape[0] > 2 else intrinsics[i])
+                base_i, base_j = len(kps[i]), len(kps[j])
+                kps[i] += [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in p0]
+                kps[j] += [cv2.KeyPoint(float(x), float(y), 1.0) for x, y in p1]
+                matches[(i, j)] = [(base_i + k, base_j + k) for k in range(len(p0))]
+        return {"keypoints": kps, "matches": matches}
     if rm_conf0_kpts and rm_conf0_mths:
         raise ValueError("rm_conf0_kpts and rm_conf0_mths cannot both be True.")
 
@@ -389,34 +495,9 @@ def extract_feat_and_match_dl(
             for pt in coords
         ]
 
-    def _coords_to_index_lookup(coords: np.ndarray) -> Dict[Tuple[float, float], int]:
-        return {
-            (round(float(pt[0]), 4), round(float(pt[1]), 4)): idx
-            for idx, pt in enumerate(coords)
-        }
-
-    def _lookup_coord_index(
-        pt: np.ndarray,
-        lookup: Dict[Tuple[float, float], int],
-        coords: np.ndarray,
-        atol: float = 1e-3,
-    ) -> Optional[int]:
-        key = (round(float(pt[0]), 4), round(float(pt[1]), 4))
-        idx = lookup.get(key)
-        if idx is not None:
-            return idx
-        if len(coords) == 0:
-            return None
-        d2 = np.sum((coords - pt[None, :]) ** 2, axis=1)
-        best_idx = int(np.argmin(d2))
-        if float(d2[best_idx]) <= float(atol) * float(atol):
-            return best_idx
-        return None
-
     frame_feature_cache: List[Dict[str, Any]] = []
     matcher_feats: List[Dict[str, Any]] = []
     keypoint_coords: List[np.ndarray] = []
-    keypoint_lookups: List[Dict[Tuple[float, float], int]] = []
     keypoints: List[List[cv2.KeyPoint]] = []
     k_inv_list: List[np.ndarray] = []
     t_c2w_list: List[np.ndarray] = []
@@ -454,7 +535,6 @@ def extract_feat_and_match_dl(
         frame_feature_cache.append(frame_feature)
         matcher_feats.append(feats)
         keypoint_coords.append(coords)
-        keypoint_lookups.append(_coords_to_index_lookup(keypoint_coords[-1]))
         keypoints.append(kps_cv)
         k_inv_list.append(np.linalg.inv(intrinsics[i].astype(np.float32)))
         t_w2c = np.eye(4, dtype=np.float32)
@@ -466,19 +546,44 @@ def extract_feat_and_match_dl(
         f"[feat-match] extraction: {extract_elapsed:.4f}s"
     )
 
+    # confidence-window maps per frame: radius 0 for the overlap pre-check, conf0_match_nearby_size for the match filter
+    nz_maps = None if conf_all is None else [_window_all_nonzero_map(conf_all[i], 0) for i in range(n)]
+    win_maps = None if conf_all is None else [_window_all_nonzero_map(conf_all[i], int(conf0_match_nearby_size)) for i in range(n)]
     matches: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
     match_pair_count = 0
     ransac_pair_count = 0
     ransac_elapsed_total = 0.0
     match_start_time = time.perf_counter()
+    # pass 1: overlap pre-check (vectorised): at least 5 keypoints with nonzero confidence project inside the previous image
+    eligible: List[Tuple[int, int]] = []
     for cur_idx in range(n):
         start_prev = max(0, cur_idx - max_prev)
         for prev_idx in range(start_prev, cur_idx):
             match_pair_count += 1
             if len(keypoints[cur_idx]) == 0 or len(keypoints[prev_idx]) == 0:
                 continue
+            depth_cur = depths[cur_idx]
+            h_prev, w_prev = imgs[prev_idx].shape[:2]
+            kc = keypoint_coords[cur_idx]
+            u_i, v_i, inside = _round_pixel_indices(kc, depth_cur.shape)
+            if nz_maps is not None:
+                inside &= nz_maps[cur_idx][np.clip(v_i, 0, depth_cur.shape[0] - 1), np.clip(u_i, 0, depth_cur.shape[1] - 1)]
+            proj, ok = _project_points_batch(kc[inside], depth_cur[v_i[inside], u_i[inside]], k_inv_list[cur_idx], t_c2w_list[cur_idx],
+                                             intrinsics[prev_idx].astype(np.float32), t_w2c_list[prev_idx])
+            ok &= (proj[:, 0] >= 0) & (proj[:, 0] < w_prev) & (proj[:, 1] >= 0) & (proj[:, 1] < h_prev)
+            if int(ok.sum()) >= 5:
+                eligible.append((cur_idx, prev_idx))
 
-            conf_cur = None if conf_all is None else conf_all[cur_idx]
+    # pass 2: the matcher on every eligible pair (one batched TensorRT call per submap when the backend offers it)
+    forward_batch = getattr(matcher.matcher, "forward_batch", None)
+    with torch.inference_mode(), _inference_autocast(torch, matcher.device):
+        if forward_batch is not None and getattr(matcher.matcher, "batch", 0) > 0 and len(eligible) >= 4:
+            preds = forward_batch([(matcher_feats[i], matcher_feats[j]) for i, j in eligible])
+        else:
+            preds = [matcher.matcher({"image0": matcher_feats[i], "image1": matcher_feats[j]}) for i, j in eligible]
+
+    # pass 3: confidence-window filter, RANSAC, bidirectional depth-reprojection gate
+    for (cur_idx, prev_idx), pred in zip(eligible, preds):
             depth_cur = depths[cur_idx]
             k_inv_cur = k_inv_list[cur_idx]
             t_c2w_cur = t_c2w_list[cur_idx]
@@ -486,142 +591,59 @@ def extract_feat_and_match_dl(
             t_w2c_cur = t_w2c_list[cur_idx]
             k_prev = intrinsics[prev_idx].astype(np.float32)
             t_w2c_prev = t_w2c_list[prev_idx]
-            h_prev, w_prev = imgs[prev_idx].shape[:2]
 
-            projected_inside = 0
-            for pt_cur in keypoint_coords[cur_idx]:
-                if not _coord_has_nonzero_conf(conf_cur, pt_cur):
-                    continue
-                u_i = int(round(float(pt_cur[0])))
-                v_i = int(round(float(pt_cur[1])))
-                if (
-                    u_i < 0
-                    or v_i < 0
-                    or u_i >= depth_cur.shape[1]
-                    or v_i >= depth_cur.shape[0]
-                ):
-                    continue
-                proj = _project_kp_to_prev(
-                    float(pt_cur[0]),
-                    float(pt_cur[1]),
-                    float(depth_cur[v_i, u_i]),
-                    k_inv_cur,
-                    t_c2w_cur,
-                    k_prev,
-                    t_w2c_prev,
-                )
-                if proj is None:
-                    continue
-                if 0 <= proj[0] < w_prev and 0 <= proj[1] < h_prev:
-                    projected_inside += 1
-                    if projected_inside >= 5:
-                        break
-            if projected_inside < 5:
-                continue
-
-            with torch.inference_mode(), _inference_autocast(torch, matcher.device):
-                pred = matcher.matcher(
-                    {
-                        "image0": matcher_feats[cur_idx],
-                        "image1": matcher_feats[prev_idx],
-                    }
-                )
             pred = _to_numpy_safe(pred)
             matched_indices = pred["matches"][0] if len(pred["matches"]) > 0 else np.zeros((0, 2), dtype=np.int64)
             if len(matched_indices) == 0:
                 continue
+            # The matcher returns keypoint indices, so the filters below carry index arrays (the former per-point Python
+            # loops mapped coordinates back to indices through a lookup dict; SuperPoint keypoints are unique after NMS,
+            # so this is the same set). All steps are vectorised: 15 pairs x ~1k matches per submap.
             all_kpts_cur = keypoint_coords[cur_idx]
             all_kpts_prev = keypoint_coords[prev_idx]
-            matched_cur = all_kpts_cur[matched_indices[:, 0]]
-            matched_prev = all_kpts_prev[matched_indices[:, 1]]
-            if rm_conf0_mths:
-                matched_cur, matched_prev = _filter_zero_confidence_matches(
-                    matched_cur,
-                    matched_prev,
-                    conf_0=conf_cur,
-                    conf_1=None if conf_all is None else conf_all[prev_idx],
-                    nearby_size=int(conf0_match_nearby_size),
-                )
-            if use_inlier_matches:
-                ransac_start_time = time.perf_counter()
-                matched_cur, matched_prev = _essential_inlier_matches(
-                    matched_cur,
-                    matched_prev,
-                    k_cur,
-                    k_prev,
-                    threshold_px=float(ransac_reproj_thresh),
-                )
-                ransac_elapsed_total += time.perf_counter() - ransac_start_time
-                ransac_pair_count += 1
-            if len(matched_cur) == 0 or len(matched_prev) == 0:
-                continue
-
-            pair_matches: List[Tuple[int, int]] = []
-            seen_pairs = set()
+            idx_cur = matched_indices[:, 0].astype(np.int64)
+            idx_prev = matched_indices[:, 1].astype(np.int64)
             depth_prev = depths[prev_idx]
             k_inv_prev = k_inv_list[prev_idx]
             t_c2w_prev = t_c2w_list[prev_idx]
-            for pt_cur, pt_prev in zip(matched_cur, matched_prev):
-                cur_kp_idx = _lookup_coord_index(
-                    pt_cur,
-                    keypoint_lookups[cur_idx],
-                    keypoint_coords[cur_idx],
-                )
-                prev_kp_idx = _lookup_coord_index(
-                    pt_prev,
-                    keypoint_lookups[prev_idx],
-                    keypoint_coords[prev_idx],
-                )
-                if cur_kp_idx is None or prev_kp_idx is None:
-                    continue
-                pair = (int(cur_kp_idx), int(prev_kp_idx))
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                pair_matches.append(pair)
+            if rm_conf0_mths and conf_all is not None:
+                # both matched pixels need a fully nonzero confidence window (radius conf0_match_nearby_size)
+                keep = np.ones(len(idx_cur), dtype=bool)
+                for kp_all, idx, win in ((all_kpts_cur, idx_cur, win_maps[cur_idx]), (all_kpts_prev, idx_prev, win_maps[prev_idx])):
+                    u_i, v_i, inside = _round_pixel_indices(kp_all[idx], win.shape)
+                    keep &= inside & win[np.clip(v_i, 0, win.shape[0] - 1), np.clip(u_i, 0, win.shape[1] - 1)]
+                idx_cur, idx_prev = idx_cur[keep], idx_prev[keep]
+            matched_cur = all_kpts_cur[idx_cur]
+            matched_prev = all_kpts_prev[idx_prev]
+            if use_inlier_matches:
+                ransac_start_time = time.perf_counter()
+                keep = _essential_inlier_mask(matched_cur, matched_prev, k_cur, k_prev, threshold_px=float(ransac_reproj_thresh))
+                idx_cur, idx_prev = idx_cur[keep], idx_prev[keep]
+                ransac_elapsed_total += time.perf_counter() - ransac_start_time
+                ransac_pair_count += 1
+            if len(idx_cur) == 0:
+                continue
+            # unique (cur, prev) index pairs, first occurrence kept (the former seen_pairs set)
+            _, first = np.unique(idx_cur * (len(all_kpts_prev) + 1) + idx_prev, return_index=True)
+            first.sort(); idx_cur, idx_prev = idx_cur[first], idx_prev[first]
+            pair_matches: List[Tuple[int, int]] = []
 
-            if pair_matches:
-                geo_filtered: List[Tuple[int, int]] = []
-                geo_scores: List[float] = []
-                for cur_kp_idx, prev_kp_idx in pair_matches:
-                    u_cur, v_cur = keypoints[cur_idx][cur_kp_idx].pt
-                    u_prev, v_prev = keypoints[prev_idx][prev_kp_idx].pt
-                    depth_val_cur = _depth_at_point(depth_cur, u_cur, v_cur)
-                    depth_val_prev = _depth_at_point(depth_prev, u_prev, v_prev)
-                    if depth_val_cur is None or depth_val_prev is None:
-                        continue
-
-                    proj_cur_to_prev = _project_kp_to_prev(
-                        float(u_cur),
-                        float(v_cur),
-                        depth_val_cur,
-                        k_inv_cur,
-                        t_c2w_cur,
-                        k_prev,
-                        t_w2c_prev,
-                    )
-                    proj_prev_to_cur = _project_kp_to_prev(
-                        float(u_prev),
-                        float(v_prev),
-                        depth_val_prev,
-                        k_inv_prev,
-                        t_c2w_prev,
-                        k_cur,
-                        t_w2c_cur,
-                    )
-                    if proj_cur_to_prev is None or proj_prev_to_cur is None:
-                        continue
-
-                    err_cur_to_prev = float(
-                        np.hypot(proj_cur_to_prev[0] - u_prev, proj_cur_to_prev[1] - v_prev)
-                    )
-                    err_prev_to_cur = float(
-                        np.hypot(proj_prev_to_cur[0] - u_cur, proj_prev_to_cur[1] - v_cur)
-                    )
-                    if err_cur_to_prev <= float(max_reproj_error) and err_prev_to_cur <= float(max_reproj_error):
-                        geo_filtered.append((cur_kp_idx, prev_kp_idx))
-                        geo_scores.append(err_cur_to_prev + err_prev_to_cur)
-                pair_matches = geo_filtered
+            if len(idx_cur):
+                # bidirectional depth-reprojection gate
+                uv_c, uv_p = all_kpts_cur[idx_cur], all_kpts_prev[idx_prev]
+                uc_i, vc_i, in_c = _round_pixel_indices(uv_c, depth_cur.shape)
+                up_i, vp_i, in_p = _round_pixel_indices(uv_p, depth_prev.shape)
+                ok = in_c & in_p
+                d_c = np.zeros(len(idx_cur), dtype=np.float32); d_p = np.zeros(len(idx_cur), dtype=np.float32)
+                d_c[ok] = depth_cur[vc_i[ok], uc_i[ok]]; d_p[ok] = depth_prev[vp_i[ok], up_i[ok]]
+                proj_cp, ok_cp = _project_points_batch(uv_c, d_c, k_inv_cur, t_c2w_cur, k_prev, t_w2c_prev)
+                proj_pc, ok_pc = _project_points_batch(uv_p, d_p, k_inv_prev, t_c2w_prev, k_cur, t_w2c_cur)
+                ok &= ok_cp & ok_pc
+                err_cp = np.hypot(proj_cp[:, 0] - uv_p[:, 0], proj_cp[:, 1] - uv_p[:, 1])
+                err_pc = np.hypot(proj_pc[:, 0] - uv_c[:, 0], proj_pc[:, 1] - uv_c[:, 1])
+                ok &= (err_cp <= float(max_reproj_error)) & (err_pc <= float(max_reproj_error))
+                pair_matches = [(int(a), int(b)) for a, b in zip(idx_cur[ok], idx_prev[ok])]
+                geo_scores = (err_cp[ok] + err_pc[ok]).astype(float).tolist()
                 pair_matches = _limit_matches_per_patch(
                     pair_matches=pair_matches,
                     keypoints_cur=keypoints[cur_idx],
@@ -670,6 +692,24 @@ def verify_frame_pair_match_dl(
     precomputed_feature_0: Optional[Dict[str, Any]] = None,
     precomputed_feature_1: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if matcher_name.endswith("-nn"):   # one-shot matchers (sift-nn/orb-nn): no extractor/matcher split
+        from vismatch.utils import to_tensor_image as _tti
+        import torch as _t
+        m = _get_vismatch_matcher_cached(matcher_name=matcher_name, device=device, max_num_keypoints=max_num_keypoints)
+        t0 = _tti(_frame_to_vismatch_input(image_0)).to(m.device)
+        t1 = _tti(_frame_to_vismatch_input(image_1)).to(m.device)
+        with _t.inference_mode():
+            out = m(t0, t1)
+        p0 = np.asarray(out["matched_kpts0"], np.float32).reshape(-1, 2)
+        p1 = np.asarray(out["matched_kpts1"], np.float32).reshape(-1, 2)
+        n_raw = len(p0)
+        if n_raw >= 8:
+            _, inl = cv2.findEssentialMat(p0, p1, intrinsics_0.astype(np.float64),
+                                          method=cv2.USAC_MAGSAC, prob=0.999, threshold=ransac_reproj_thresh)
+            if inl is not None:
+                keep = inl.reshape(-1).astype(bool); p0, p1 = p0[keep], p1[keep]
+        return {"num_raw_matches": int(n_raw), "num_inlier_matches": int(len(p0)),
+                "matched_points0": p0, "matched_points1": p1}
     """
     Verify a frame pair using a vismatch deep matcher followed by essential-matrix RANSAC.
 

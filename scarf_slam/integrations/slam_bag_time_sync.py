@@ -567,3 +567,34 @@ def compute_folder_image_pose_timestamp_sync(
             int(timestamp_nsec) for timestamp_nsec in previous_session_image_timestamps_nsec
         },
     )
+
+
+def compute_bag_images_pose_file_sync(
+    input_bag: str | Path,
+    poses_path: str | Path,
+    *,
+    image_topic: str,
+    frame_stride: int = 1,
+    tolerance_sec: float,
+    previous_session_image_timestamps_nsec: Iterable[int] = (),
+) -> BagTimestampSyncResult:
+    """Bag images + TUM pose file (2026-10-01): the poses are interpolated at the selected frames' stamps by the loader, so
+    every selected frame inside the pose span has an exact pose; frames outside the span are not frames of this session."""
+    from scarf_slam.integrations.slam_bag import select_bag_frames
+
+    if tolerance_sec < 0:
+        raise ValueError(f"image_pose_timestamp_tolerance_sec must be non-negative, got {tolerance_sec}")
+    frames = select_bag_frames(input_bag, image_topic, frame_stride)
+    poses = read_pose_file(poses_path)
+    t0 = int(poses[0][0]) * 1_000_000_000 + int(poses[0][1]); t1 = int(poses[-1][0]) * 1_000_000_000 + int(poses[-1][1])
+    stamps = [hdr for hdr, _, _ in frames if t0 <= hdr <= t1]
+    if not stamps:
+        raise FileNotFoundError(f"No frame of {input_bag} falls inside the pose span of {poses_path}")
+    return _build_sync_result(
+        Path(input_bag).expanduser(),
+        image_timestamps_nsec=set(stamps),
+        pose_timestamps_nsec=set(stamps),
+        path_message_timestamps_nsec=[(stamps[-1], stamps)],
+        tolerance_sec=tolerance_sec,
+        previous_session_image_timestamps_nsec_set={int(x) for x in previous_session_image_timestamps_nsec},
+    )

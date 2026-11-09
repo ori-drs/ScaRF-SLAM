@@ -1,6 +1,13 @@
 model_name: da
 torch_compile: false
 torch_compile_mode: default
+da3_model: depth-anything/DA3NESTED-GIANT-LARGE-1.1
+conf_thresh_percentile: 25 # per frame, drop depth pixels at or below this confidence percentile
+save_per_frame_local_pointclouds: true # recon/<name>/pts_local*/
+save_graph_debug_artifacts: true # graph submaps/, matches/ and frame images, needed to resume from this run (prev_slam_folder)
+pointcloud_format: ply # pts_global / per-frame clouds: ply (binary, no size limit) | pcd (LZF-compressed PCD, capped at ~1.3e8 points)
+submap_scale_solver: gtsam # or numpy: same objective and LM schedule, vectorized (scales agree to ~1e-14, ~15x faster)
+frame_scale_solver: gtsam # or numpy, same as above for the per-frame scales
 
 use_slam: false
 is_mono: false

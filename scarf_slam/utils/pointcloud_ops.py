@@ -135,3 +135,57 @@ def submap_to_world_pointcloud(
         axis=1,
     )
     return np.ascontiguousarray(pts_world_with_conf), np.ascontiguousarray(colors)
+
+
+def _voxel_downsample_mean(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float, device: str) -> Tuple[np.ndarray, np.ndarray]:
+    pts = torch.from_numpy(np.ascontiguousarray(xyz, dtype=np.float32)).to(device)
+    key = torch.floor(pts / voxel_size).to(torch.int64)
+    key -= key.min(0).values
+    dims = key.max(0).values + 1
+    lin = (key[:, 0] * dims[1] + key[:, 1]) * dims[2] + key[:, 2]
+    del key
+    uniq, inv = torch.unique(lin, return_inverse=True)
+    del lin
+    n = len(uniq)
+    del uniq
+    cnt = torch.bincount(inv, minlength=n).unsqueeze(1).to(torch.float32)
+    out_xyz = torch.zeros((n, 3), dtype=torch.float32, device=device).index_add_(0, inv, pts).div_(cnt)
+    del pts
+    cols = torch.from_numpy(np.ascontiguousarray(rgb, dtype=np.float32)).to(device)
+    out_rgb = torch.zeros((n, 3), dtype=torch.float32, device=device).index_add_(0, inv, cols).div_(cnt)
+    return out_xyz.cpu().numpy(), out_rgb.cpu().numpy()
+
+
+def write_ply_xyzrgb(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    """Binary little-endian PLY (float32 x y z, uint8 red green blue) written in one numpy write: no size limit, 15 bytes per
+    point. rgb is uint8 0-255, or float in [0, 1]."""
+    xyz = np.asarray(xyz)
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(np.rint(rgb.astype(np.float32) * 255.0), 0, 255).astype(np.uint8)
+    rec = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    rec["x"], rec["y"], rec["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {len(xyz)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+    )
+    with open(path, "wb") as handle:
+        handle.write(header.encode("ascii"))
+        rec.tofile(handle)
+
+
+def voxel_downsample_mean(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean position and colour of the points in each occupied voxel (voxel index = floor(p / voxel_size)).
+    Runs on the GPU when one is available (~1 s for 1.8e8 points), otherwise, or if the GPU runs out of
+    memory, on the CPU (~11 s)."""
+    if torch.cuda.is_available():
+        try:
+            return _voxel_downsample_mean(xyz, rgb, voxel_size, "cuda")
+        except torch.cuda.OutOfMemoryError:
+            pass
+        finally:
+            torch.cuda.empty_cache()
+    return _voxel_downsample_mean(xyz, rgb, voxel_size, "cpu")

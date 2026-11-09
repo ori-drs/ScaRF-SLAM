@@ -95,7 +95,8 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
                     pinhole_intrinsics=app.pinhole_camera.intrinsics,
                     pinhole_resolution=app.pinhole_camera.resolution,
                     yaw=yaw,
-                    pitch=pitch
+                    pitch=pitch,
+                    max_theta_deg=app.config.get("fisheye_max_theta_deg"),
                 )
             else:
                 raise ValueError("Fisheye camera must use pinhole camera model with equidistant distortion")
@@ -132,23 +133,38 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
     #     log_cuda_memory("before inference")
 
     if use_extrinsics:
-        predictions = app.model.inference(
+        _inf = lambda: app.model.inference(
             image=image_data_lst,
             extrinsics=np.stack(extrinsics_lst, axis=0).astype(np.float32),
             intrinsics=intrinsics_array,
             align_to_input_ext_scale=True,
             ref_view_strategy="saddle_balanced",
         )
+        try:
+            predictions = _inf()
+        except Exception as e:
+            # DA3 fits its depth scale to the input poses with RANSAC once a batch has >= 10 views, and the final refit on the
+            # best inliers is unguarded: with several views per keyframe (pinhole_views_yaw) the inliers can be views sharing one
+            # camera centre, and evo's Umeyama raises. Retry this batch with the plain Umeyama fit over all views (2026-10-25).
+            import functools
+            print(f"DA3 pose alignment failed ({type(e).__name__}: {e}); retrying this batch without RANSAC", flush=True)
+            _orig = app.model._align_to_input_extrinsics_intrinsics
+            app.model._align_to_input_extrinsics_intrinsics = functools.partial(_orig, ransac_view_thresh=10**9)
+            try:
+                predictions = _inf()
+            finally:
+                app.model._align_to_input_extrinsics_intrinsics = _orig
     else:
         predictions = app.model.inference(
             image=image_data_lst,
             intrinsics=intrinsics_array,
         )
-        raise NotImplementedError(
-            "Requires additional implementation to align the predicted depth scale "
-            "with the SLAM pose scale and to overwrite predictions.intrinsics and "
-            "predictions.extrinsics with the calibrated intrinsics and SLAM poses."
-        )
+        # single-view models (DA3MONO) estimate no poses: downstream needs the input VIO extrinsics
+        predictions.extrinsics = np.stack(extrinsics_lst, axis=0).astype(np.float32)
+        # mono predictions carry no confidence; a uniform map keeps the percentile filter a no-op
+        _conf = getattr(predictions, "conf", None)
+        if _conf is None or np.asarray(_conf).dtype == object:
+            predictions.conf = np.ones(np.asarray(predictions.depth).shape, dtype=np.float32)
 
     # if torch.cuda.is_available():
     #     torch.cuda.synchronize()
