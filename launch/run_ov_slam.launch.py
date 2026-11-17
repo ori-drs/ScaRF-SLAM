@@ -442,10 +442,10 @@ def launch_setup(context):
             condition=IfCondition(LaunchConfiguration("posegraph_enable")),
             remappings=[
                 (
-                    # Fixed subscription topic in ov_secondary_loop_fusion
-                    # (kLoopImageTopic); point it at OpenVINS' cam0 stream.
-                    "/ov_msckf/cam0/image_raw/compressed",
-                    _compressed_topic(camera_topics[0]),
+                    # Fixed raw-image subscription topic in ov_secondary_loop_fusion
+                    # (kLoopImageTopic); point it at OpenVINS' raw cam0 stream.
+                    "/ov_msckf/cam0/image_raw",
+                    camera_topics[0],
                 )
             ],
             emulate_tty=True,
