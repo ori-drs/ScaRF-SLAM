@@ -4,6 +4,8 @@ import re
 import tempfile
 from pathlib import Path
 
+import yaml
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -174,19 +176,46 @@ def _cleanup_generated_file_on_shutdown(file_path):
     return RegisterEventHandler(OnShutdown(on_shutdown=on_shutdown))
 
 
-def _image_conversion_topics(max_cameras):
-    if max_cameras == "1":
-        return [
-            "/insta/cam0/image_raw/compressed",
-            "/insta/cam0/image_raw",
-        ]
+def _load_opencv_yaml(path):
+    # OpenCV YAML files start with a "%YAML:1.0" directive that PyYAML rejects.
+    with open(path, "r", encoding="utf-8") as config_file:
+        content = "".join(
+            line for line in config_file if not line.lstrip().startswith("%")
+        )
+    return yaml.safe_load(content) or {}
 
-    return [
-        "/insta/cam0/image_raw/compressed",
-        "/insta/cam1/image_raw/compressed",
-        "/insta/cam0/image_raw",
-        "/insta/cam1/image_raw",
-    ]
+
+def _openvins_camera_topics(estimator_config_path, max_cameras):
+    """Read the raw image topics OpenVINS subscribes to from its kalibr imucam config."""
+    estimator_config = _load_opencv_yaml(estimator_config_path)
+    imucam_relative_path = estimator_config.get("relative_config_imucam")
+    if not imucam_relative_path:
+        raise ValueError(
+            f"'relative_config_imucam' is not set in '{estimator_config_path}'"
+        )
+
+    imucam_path = os.path.join(
+        os.path.dirname(os.path.abspath(estimator_config_path)),
+        imucam_relative_path,
+    )
+    imucam_config = _load_opencv_yaml(imucam_path)
+
+    topics = []
+    for cam_index in range(int(max_cameras)):
+        cam_key = f"cam{cam_index}"
+        topic = (imucam_config.get(cam_key) or {}).get("rostopic")
+        if not topic:
+            raise ValueError(f"'{cam_key}.rostopic' is not set in '{imucam_path}'")
+        topics.append(topic)
+    return topics
+
+
+def _compressed_topic(raw_topic):
+    return f"{raw_topic.rstrip('/')}/compressed"
+
+
+def _image_conversion_topics(raw_topics):
+    return [_compressed_topic(topic) for topic in raw_topics] + list(raw_topics)
 
 
 def _quoted_opencv_yaml_string(value):
@@ -261,6 +290,7 @@ def launch_setup(context):
     shutdown_state = {"requested": False}
     max_cameras = LaunchConfiguration("max_cameras").perform(context)
     openvins_config_path = LaunchConfiguration("openvins_config_path").perform(context)
+    camera_topics = None
     if not os.path.isfile(openvins_config_path):
         openvins_actions.append(
             LogInfo(
@@ -272,6 +302,22 @@ def launch_setup(context):
                 )
             )
         )
+    else:
+        try:
+            camera_topics = _openvins_camera_topics(openvins_config_path, max_cameras)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            openvins_actions.append(
+                LogInfo(
+                    msg=(
+                        "ERROR: could not read camera topics from OpenVINS config "
+                        "'{}': {} - not starting OpenVINS"
+                    ).format(openvins_config_path, exc)
+                )
+            )
+
+    camera_topics_missing_msg = (
+        "camera topics could not be read from openvins_config_path"
+    )
 
     if not openvins_actions:
         openvins_node = Node(
@@ -320,13 +366,22 @@ def launch_setup(context):
                 ).format(image_conversion_script)
             )
         )
+    elif camera_topics is None:
+        image_conversion_actions.append(
+            LogInfo(
+                msg=(
+                    f"ERROR: {camera_topics_missing_msg} - "
+                    "not starting image conversion"
+                )
+            )
+        )
     else:
         image_conversion_process = ExecuteProcess(
             condition=IfCondition(LaunchConfiguration("image_conversion")),
             cmd=[
                 "/usr/bin/python3",
                 image_conversion_script,
-                *_image_conversion_topics(max_cameras),
+                *_image_conversion_topics(camera_topics),
                 "--ros-args",
                 "-r",
                 PythonExpression(
@@ -361,6 +416,12 @@ def launch_setup(context):
                 ).format(ov_secondary_config_path)
             )
         )
+    elif camera_topics is None:
+        ov_secondary_actions.append(
+            LogInfo(
+                msg=f"ERROR: {camera_topics_missing_msg} - not starting OV secondary"
+            )
+        )
     else:
         ov_secondary_config_path, generated_ov_secondary_config_path = (
             _write_ov_secondary_config_override(
@@ -381,8 +442,10 @@ def launch_setup(context):
             condition=IfCondition(LaunchConfiguration("posegraph_enable")),
             remappings=[
                 (
+                    # Fixed subscription topic in ov_secondary_loop_fusion
+                    # (kLoopImageTopic); point it at OpenVINS' cam0 stream.
                     "/ov_msckf/cam0/image_raw/compressed",
-                    "/insta/cam0/image_raw/compressed",
+                    _compressed_topic(camera_topics[0]),
                 )
             ],
             emulate_tty=True,
