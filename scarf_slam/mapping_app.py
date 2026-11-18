@@ -52,7 +52,9 @@ from scarf_slam.core.camera import (
 from scarf_slam.utils.pointcloud_ops import (
     depth_to_world_points_vectorized,
     submap_to_world_pointcloud,
+    voxel_downsample_mean,
     world_points_to_anchor_local,
+    write_ply_xyzrgb,
 )
 from scarf_slam.mapping import graph_io
 from scarf_slam.utils.timestamp_ops import (
@@ -66,6 +68,7 @@ from scarf_slam.utils import keyframe_selection
 from scarf_slam.integrations.slam_bag_time_sync import (
     compute_bag_image_pose_timestamp_sync,
     compute_folder_image_pose_timestamp_sync,
+    compute_bag_images_pose_file_sync,
     read_bag_start_image_timestamp_nsec,
     read_folder_start_image_timestamp_nsec,
 )
@@ -76,6 +79,7 @@ from scarf_slam.integrations.slam_bag import (
     DEFAULT_TRAJECTORY_TOPIC,
     load_slam_bag,
     load_image_folder_and_poses,
+    load_bag_images_and_poses,
 )
 from scarf_slam.integrations import ros2_publishing
 from scarf_slam.integrations.ros2_publishing import (
@@ -101,6 +105,41 @@ TIMESTAMP_KEY_RE = re.compile(r"^\d{10}_\d{9}$")
 ANSI_GREEN = "\033[92m"
 ANSI_YELLOW = "\033[93m"
 ANSI_RESET = "\033[0m"
+
+
+def _clone_tensors(x):
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    if isinstance(x, dict):
+        return type(x)({k: _clone_tensors(v) for k, v in x.items()})
+    if isinstance(x, (list, tuple)):
+        return type(x)(_clone_tensors(v) for v in x)
+    return x
+
+
+class _EagerFirstCallCompiled(torch.nn.Module):
+    """torch.compile(mode="reduce-overhead") wrapper for the depth model. The first call runs eagerly so the DA3 RoPE caches
+    (patch positions, cos/sin tables) hold ordinary tensors; filled inside a CUDA graph, the next replay would overwrite them.
+    Every later call starts a new CUDA graph step and returns cloned outputs, which stay valid after the next replay."""
+
+    def __init__(self, module: torch.nn.Module, mode: str):
+        super().__init__()
+        self.module = module
+        self.compiled = torch.compile(module, mode=mode)
+        self.warm = False
+
+    def forward(self, *args, **kwargs):
+        if not self.warm:
+            self.warm = True
+            return self.module(*args, **kwargs)
+        torch.compiler.cudagraph_mark_step_begin()
+        return _clone_tensors(self.compiled(*args, **kwargs))
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
 
 
 def _iter_manifest_timestamp_keys(value) -> Set[str]:
@@ -185,9 +224,9 @@ class ScaRFSLAM():
         prefix = "\t" * indent
         line = f"{prefix}{label}: {duration:.6f} seconds"
         if color is not None:
-            print(f"{color}{line}\033[0m")
+            print(f"{color}{line}\033[0m", flush=True)
         else:
-            print(line)
+            print(line, flush=True)
 
 
     def _add_elapsed_time(self, attr_name: str, start_time: float) -> float:
@@ -1409,13 +1448,14 @@ class ScaRFSLAM():
             iters=30,
             max_points_per_overlap_frame=max_points_per_overlap_frame,
             robust_delta=0.1,
-            reg_weight=0.01,
+            reg_weight=float(os.environ.get("SCARF_PERIODIC_REG", 0.01)),   # windowed (periodic) solve: pull toward 1; default as before
             normalize_mean=False,
             use_exp_param=True,
             random_seed=0,
             latest_n_submaps=latest_n_submaps,
             covisible_frame_pairs=covisible_frame_pairs,
             frame_pair_match_dict=frame_pair_match_dict,
+            solver=str(self.config.get("submap_scale_solver", "gtsam")),
         )
         for submap_key, scale_value in submap_scales_dict.items():
             if submap_key not in self.submaps:
@@ -1427,6 +1467,14 @@ class ScaRFSLAM():
 
 
     def _filter_prediction_confidence(self, predictions, conf_thresh_percentile: float):
+        if self.config.get("mask_black_pixels", False) and getattr(predictions, "processed_images", None) is not None:
+            # rotated views reach past the fisheye circle: the rectifier fills those pixels with 0, so they carry no image
+            # and must not become points (conf 0 = dropped by fusion and by the hook readers)
+            black = np.asarray(predictions.processed_images).max(axis=-1) <= 4
+            if black.shape == np.asarray(predictions.conf).shape:
+                predictions.conf = np.where(black, 0, predictions.conf)
+                predictions.depth = np.where(black, 0, predictions.depth)
+                print(f"Black-pixel mask removed {int(np.count_nonzero(black))} pixels outside the fisheye image.")
         prediction_sky = getattr(predictions, "sky", None)
         if prediction_sky is not None:
             sky_mask = np.asarray(prediction_sky).astype(bool)
@@ -1436,6 +1484,33 @@ class ScaRFSLAM():
                 f"Sky filtering removed {int(np.count_nonzero(sky_mask))} "
                 "pixels using prediction sky mask."
             )
+        elif os.environ.get("SCARF_CONF_FILTER_TORCH", "1") == "1" and torch.cuda.is_available() and not torch.is_tensor(predictions.depth):
+            # the same percentile thresholds and masks on the GPU (torch.quantile = np.percentile's linear interpolation), the
+            # arrays written back as numpy: 18 ms -> ~2 ms per batch (2026-11-06)
+            d = torch.as_tensor(np.asarray(predictions.depth), device="cuda"); c = torch.as_tensor(np.asarray(predictions.conf), device="cuda")
+            z_c = torch.zeros((), dtype=c.dtype, device=c.device); z_d = torch.zeros((), dtype=d.dtype, device=d.device)
+            fin = torch.isfinite(d); fd = d[fin]
+            if fd.numel() > 0:
+                thr = torch.quantile(fd.double(), 0.99).item(); sky = d >= thr
+                c = torch.where(sky, z_c, c); d = torch.where(sky, z_d, d)
+                print(f"Sky filtering removed {int(sky.sum())} pixels at p99 depth threshold {thr:.6f}.")
+            else:
+                print("Warning: no finite depth values available for sky filtering.")
+            fnz = d[torch.isfinite(d) & (d > 0)]
+            depth_p50 = float(torch.quantile(fnz.double(), 0.5).item()) if fnz.numel() else float("nan")
+            max_distance_threshold = max(float(self.max_distance), depth_p50)
+            c = torch.where(d > max_distance_threshold, z_c, c)
+            nz = c[c != 0]
+            if nz.numel() and (nz.max() - nz.min()) != 0:
+                conf_threshold = torch.quantile(nz.double(), conf_thresh_percentile / 100.0).item()
+                c = torch.where(c <= conf_threshold, z_c, c)
+                predictions.conf = c.cpu().numpy(); predictions.depth = d.cpu().numpy()
+                if self.model_name == "da" and self.fisheye_cameras:
+                    edge_masks = map_fusion.mask_depth_edge_batch(depth=predictions.depth, kernel_size=3, rtol=0.03)
+                    predictions.conf[edge_masks] = 0.0
+            else:
+                predictions.conf = c.cpu().numpy(); predictions.depth = d.cpu().numpy()
+            return predictions
         else:
             finite_depth = predictions.depth[np.isfinite(predictions.depth)]
             if finite_depth.size > 0:
@@ -1459,6 +1534,9 @@ class ScaRFSLAM():
         predictions.conf = np.where(predictions.depth > max_distance_threshold, 0, predictions.conf)
         # predictions.depth = np.where(predictions.depth > max_distance_threshold, 0, predictions.depth)
 
+        _nz_conf = predictions.conf[predictions.conf != 0]   # after the sky / range zeroing: a uniform NONZERO conf (mono models) carries no ranking to filter on
+        if _nz_conf.size == 0 or np.ptp(_nz_conf) == 0:
+            return predictions
         conf_threshold = np.percentile(predictions.conf[predictions.conf != 0], conf_thresh_percentile)
         predictions.conf[predictions.conf <= conf_threshold] = 0.0
         # predictions.depth[predictions.conf < conf_threshold] = 0.0
@@ -1548,15 +1626,19 @@ class ScaRFSLAM():
 
         # --- load trajectories and image timestamps ---
         use_slam = bool(self.config.get("use_slam"))
-        using_file_input = self.image_folder is not None or self.poses is not None
+        # input modes: bag (images + trajectory topics), image folder + pose file, or bag images + pose file (2026-10-01:
+        # --input_bag with --poses and no --image_folder; frames read from the mcap on demand, poses interpolated at them)
+        bag_pose_file_input = self.input_bag is not None and self.poses is not None and self.image_folder is None
+        using_file_input = (self.image_folder is not None or self.poses is not None) and not bag_pose_file_input
         if self.input_bag is None and not using_file_input:
             raise ValueError("Either --input_bag or both --image_folder and --poses must be provided.")
         if self.input_bag is not None and using_file_input:
-            raise ValueError("--input_bag cannot be used together with --image_folder/--poses.")
+            raise ValueError("--input_bag cannot be used together with --image_folder (use --input_bag with --poses for bag images + pose file).")
         if using_file_input and (self.image_folder is None or self.poses is None):
             raise ValueError("--image_folder and --poses must be provided together.")
-        if using_file_input and use_slam:
-            raise ValueError("--image_folder/--poses input requires use_slam: false in the config.")
+        if (using_file_input or bag_pose_file_input) and use_slam:
+            raise ValueError("--image_folder/--poses and --input_bag/--poses input require use_slam: false in the config.")
+        bag_image_stride = int(self.config.get("bag_image_stride", 1))
 
         slam_odometry_topic = (
             self.config.get("slam_odometry_topic", DEFAULT_ODOMETRY_TOPIC)
@@ -1602,7 +1684,16 @@ class ScaRFSLAM():
                 f"timestamps={len(previous_image_timestamps_nsec)}"
             )
 
-        if using_file_input:
+        if bag_pose_file_input:
+            sync_result = compute_bag_images_pose_file_sync(
+                self.input_bag,
+                self.poses,
+                image_topic=slam_image_topic,
+                frame_stride=bag_image_stride,
+                tolerance_sec=timestamp_tolerance_sec,
+                previous_session_image_timestamps_nsec=previous_image_timestamps_nsec,
+            )
+        elif using_file_input:
             sync_result = compute_folder_image_pose_timestamp_sync(
                 self.image_folder,
                 self.poses,
@@ -1659,7 +1750,15 @@ class ScaRFSLAM():
         if sync_start_timestamp_nsec is not None:
             self.session_start_time = timestamp_nsec_to_key(sync_start_timestamp_nsec)
 
-        if using_file_input:
+        if bag_pose_file_input:
+            self.slam_bag_data = load_bag_images_and_poses(
+                self.input_bag,
+                self.poses,
+                image_topic=slam_image_topic,
+                frame_stride=bag_image_stride,
+                pose_timestamp_map=pose_timestamp_map,
+            )
+        elif using_file_input:
             self.slam_bag_data = load_image_folder_and_poses(
                 self.image_folder,
                 self.poses,
@@ -1768,9 +1867,17 @@ class ScaRFSLAM():
             self.recon_save_folder_name = self.recon_save_folder_name + "_slam"
 
         # current implementation always assume using forward pinhole image.
-        self.ph_views_per_ref_pose = [
-            RotateParam(cam="cam0", yaw=0, pitch=0),
-        ]
+        # pinhole_view_yaw / pinhole_view_pitch (deg, default 0): one rotated virtual pinhole cut from the cam0 fisheye
+        # instead of the forward one (2026-10-25: side views of the Spot Insta360; the pose of each view is T_world_cam0 @ T_cam0_view)
+        # pinhole_views_yaw (list, deg): several views per keyframe, all fed to DA3 in the same batch (2026-10-25, Spot side views)
+        _yaws = self.config.get("pinhole_views_yaw")
+        if _yaws:
+            self.ph_views_per_ref_pose = [RotateParam(cam="cam0", yaw=float(y), pitch=float(self.config.get("pinhole_view_pitch", 0.0))) for y in _yaws]
+        else:
+            self.ph_views_per_ref_pose = [
+                RotateParam(cam="cam0", yaw=float(self.config.get("pinhole_view_yaw", 0.0)), pitch=float(self.config.get("pinhole_view_pitch", 0.0))),
+            ]
+        print(f"pinhole views per keyframe: {[(v.cam, v.yaw, v.pitch) for v in self.ph_views_per_ref_pose]}")
         self.ph_views_per_batch = [self.ph_views_per_ref_pose] * self.num_ref_poses_per_batch
         self.num_ph_views_per_ref_pose = len(self.ph_views_per_ref_pose)
         self.overlap_ph_views = self.overlap_ref_views * self.num_ph_views_per_ref_pose
@@ -1785,9 +1892,42 @@ class ScaRFSLAM():
             )
 
         # --- load model ---
-        if self.model_name == "da":
+        if self.model_name == "da" and self.config.get("da3_trt_engine"):
+            # single-view DA3 as a TensorRT engine (Jetson deployment): mono path, VIO extrinsics attached downstream
+            from scarf_slam.backends.da3_mono_trt import DA3MonoTrt
+            self.model = DA3MonoTrt(self.config["da3_trt_engine"]); self.da3_is_mono = True
+        elif self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
-            self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
+            da3_id = self.config.get("da3_model", "depth-anything/DA3NESTED-GIANT-LARGE-1.1")
+            print(f"[scarf] depth model: {da3_id}")
+            self.da3_is_mono = any(k in da3_id.upper() for k in ("MONO", "METRIC"))   # single-view checkpoints: no pose estimation, uniform confidence
+            _ck = (da3_id, str(self.device))
+            _cache = globals().setdefault("_DA3_MODEL_CACHE", {})
+            if _ck not in _cache:  # a long-lived process reuses the weights, saving the ~20 s reload per run
+                _m = None
+                try:  # fast path: construct on the CUDA device (no second copy on the host) and read the safetensors straight into it
+                    import json as _json, torch as _torch
+                    from huggingface_hub import hf_hub_download as _dl
+                    from safetensors.torch import load_file as _lf
+                    _cfg = _json.load(open(_dl(da3_id, "config.json")))
+                    with _torch.device(self.device):
+                        _m = DepthAnything3(model_name=_cfg.get("model_name", da3_id.split("/")[-1].lower()))
+                    _sd = _lf(_dl(da3_id, "model.safetensors"), device=str(self.device))
+                    _m.load_state_dict(_sd, strict=False)  # the checkpoint carries no aux-head weights, as the official loader also allows
+                    _m = _m.eval()
+                except Exception as _e:
+                    print(f"[scarf] fast-load fallback ({type(_e).__name__}: {str(_e)[:80]})")
+                    _m = DepthAnything3.from_pretrained(da3_id).to(device=self.device)
+                _cache[_ck] = _m
+            self.model = _cache[_ck]
+            if self.config.get("da3_trt_nested"):
+                # the nested giant with both of its networks as TensorRT engines (scarf_slam/backends/da3_nested_trt.py); the api object keeps
+                # only its pre/post-processing, the torch networks are released
+                from scarf_slam.backends.da3_nested_trt import DA3NestedTrt
+                import torch as _torch
+                self.model.model = DA3NestedTrt(self.config["da3_trt_nested"], views=int(self.config.get("da3_trt_views", 6)),
+                                             height=int(self.config.get("da3_trt_height", 378)), width=int(self.config.get("da3_trt_width", 504)))
+                _cache.pop(_ck, None); _torch.cuda.empty_cache()
             if self.config.get("torch_compile", False):
                 # Compile only when requested; warmup batches are slower.
                 compile_mode = self.config.get("torch_compile_mode", "default")
@@ -1795,7 +1935,10 @@ class ScaRFSLAM():
                     f"[scarf] torch.compile depth model (mode={compile_mode}); "
                     "expect slow warmup batches while compiling"
                 )
-                self.model.model = torch.compile(self.model.model, mode=compile_mode)
+                if compile_mode == "reduce-overhead":
+                    self.model.model = _EagerFirstCallCompiled(self.model.model, compile_mode)
+                else:
+                    self.model.model = torch.compile(self.model.model, mode=compile_mode)
         else:
             raise ValueError(f"Invalid self.model_name: {self.model_name}")
 
@@ -1856,12 +1999,14 @@ class ScaRFSLAM():
                 updated_traj = False
                 if self.config.get("use_slam"):
                     updated_traj = self._refresh_slam_trajectory_for_batch([self.ref_timestamps[-1]])
+                final_step_start = time.perf_counter()
                 if self.submap_scale_opt and not updated_traj:
                     self._run_submap_scale_optimization(
                         latest_n_submaps=None,
                         max_points_per_overlap_frame=100,
                         log_prefix="loop-closure global",
                     )
+                    self._print_timing_line("Final Submap Scale Optimization Time", time.perf_counter() - final_step_start)
                 sec_str, nsec_str = self.ref_timestamps[-1].split("_", 1)
                 header_timestamp = MappingTimestamp(int(sec_str), int(nsec_str))
                 self._publish_sampled_global_pointcloud(header_timestamp=header_timestamp)
@@ -1887,20 +2032,30 @@ class ScaRFSLAM():
                 self.save_out_poses_dict_to_csv(str(recon_dir / f"poses_{self.model_name}.csv"))
                 self.save_out_poses_ts_to_csv(str(recon_dir / f"poses_{self.model_name}_ts.csv"))
                 self.save_out_poses_dict_to_tum(str(recon_dir / f"poses_{self.model_name}.txt"))
-                pts_global, colors_global = self._compose_global_pointcloud()
-                self.save_global_pointcloud(pts_global, colors_global, suffix=suffix)
-                self.save_per_frame_local_pointclouds(
-                    Path(self.slam_folder)
-                    / "recon"
-                    / self.recon_save_folder_name
-                    / f"pts_local{suffix}"
-                )
+                if self.config.get("save_global_pointcloud", True):   # ScaRF's own fused cloud; consumers of the per-keyframe hook can skip it
+                    final_step_start = time.perf_counter()
+                    pts_global, colors_global = self._compose_global_pointcloud()
+                    self._print_timing_line("Final Global Point Cloud Compose Time", time.perf_counter() - final_step_start)
+                    final_step_start = time.perf_counter()
+                    self.save_global_pointcloud(pts_global, colors_global, suffix=suffix)
+                    self._print_timing_line("Final Global Point Cloud Save Time", time.perf_counter() - final_step_start)
+                if self.config.get("save_per_frame_local_pointclouds", True):
+                    final_step_start = time.perf_counter()
+                    self.save_per_frame_local_pointclouds(
+                        Path(self.slam_folder)
+                        / "recon"
+                        / self.recon_save_folder_name
+                        / f"pts_local{suffix}"
+                    )
+                    self._print_timing_line("Final Per-Frame Point Cloud Save Time", time.perf_counter() - final_step_start)
+                final_step_start = time.perf_counter()
                 self.save_graph(
                     Path(self.slam_folder)
                     / "recon"
                     / self.recon_save_folder_name
                     / f"opt_graph{suffix}"
                 )
+                self._print_timing_line("Final Graph Save Time", time.perf_counter() - final_step_start)
                 break
             
             ref_ts_sub = [self.ref_timestamps[j] for j in indices]
@@ -1924,7 +2079,7 @@ class ScaRFSLAM():
                     ref_ts_sub, 
                     self.in_ref_poses_dict,
                     self.ph_views_per_batch,
-                    use_extrinsics=True,
+                    use_extrinsics=not getattr(self, "da3_is_mono", False),
                 )
                 predictions, ph_view_poses_sub, new_ph_to_ref_dict = da_out
             else:
@@ -1940,7 +2095,9 @@ class ScaRFSLAM():
             inference_duration = self._add_elapsed_time("model_inference_time", inference_start_time)
 
             self._update_max_distance_for_batch(ref_ts_sub)
-            predictions = self._filter_prediction_confidence(predictions, conf_thresh_percentile=25)
+            predictions = self._filter_prediction_confidence(
+                predictions, conf_thresh_percentile=float(self.config.get("conf_thresh_percentile", 25))
+            )
 
             if (
                 not self.is_mono
@@ -1990,6 +2147,20 @@ class ScaRFSLAM():
             self._print_timing_line("Frame Scale Optimization Time", timing_info["frame_scale_opt_duration"], indent=0, color="\033[32m")
             self._print_timing_line("Submap Scale Optimization Time", timing_info["submap_scale_opt_duration"], indent=0, color="\033[32m")
             self._print_timing_line("Points Fusion Time", timing_info["pts_fusion_duration"], indent=0, color="\033[32m")
+            if os.environ.get("SCARF_BATCH_TIMING"):   # one JSON line per batch (2026-10-25 batch-size sweep): images, stage times, wall time, peak GPU memory
+                import json as _json
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _rec = {"batch": int(getattr(self, "_timing_batch_idx", 0)), "images": int(len(ph_view_poses_sub)), "keyframes": int(len(ref_ts_sub)),
+                        "inference_s": float(inference_duration), "match_s": float(timing_info["feature_match_duration"]),
+                        "frame_scale_s": float(timing_info["frame_scale_opt_duration"]), "submap_scale_s": float(timing_info["submap_scale_opt_duration"]),
+                        "fusion_s": float(timing_info["pts_fusion_duration"]), "wall_s": float(time.perf_counter() - inference_start_time),
+                        "peak_gpu_gb": float(torch.cuda.max_memory_allocated() / 2**30) if torch.cuda.is_available() else 0.0}
+                with open(os.environ["SCARF_BATCH_TIMING"], "a") as _f:
+                    _f.write(_json.dumps(_rec) + "\n")
+                self._timing_batch_idx = _rec["batch"] + 1
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
 
             header_timestamp = ph_view_poses_sub[-1][0]
             self._publish_sampled_global_pointcloud(header_timestamp=header_timestamp)
@@ -1997,7 +2168,11 @@ class ScaRFSLAM():
             self._publish_processed_images(predictions.processed_images, header_timestamp=header_timestamp)
 
             del predictions
-            gc.collect()
+            # A full gc pass walks every live Python object (~0.15 s per batch, ~50 s over a 330-submap sequence) and
+            # frees nothing here in practice: predictions holds no reference cycles, so `del` already releases it.
+            # Keep an occasional pass as a safety net.
+            if counter % 20 == 0:
+                gc.collect()
             torch.cuda.empty_cache()
 
             counter += int(timing_info.get("num_created_submaps", 1))
@@ -2019,7 +2194,7 @@ class ScaRFSLAM():
             feature_match_start_time = time.perf_counter()
             match_dict = feature_matching.extract_feat_and_match_dl(
                 predictions,
-                max_prev=5,
+                max_prev=int(self.config.get("frame_match_max_prev", 5)),   # images earlier in the batch list to match against (views x keyframes)
                 device=self.covisibility_graph.matcher_device,
                 matcher_name=self.vis_matcher,
                 rm_conf0_kpts=False,
@@ -2044,6 +2219,7 @@ class ScaRFSLAM():
                 reg_weight=0.05,
                 normalize_mean=False,
                 use_exp_param=True,
+                solver=str(self.config.get("frame_scale_solver", "gtsam")),
             )
             frame_scale_opt_duration = self._add_elapsed_time(
                 "frame_scale_opt_time",
@@ -2076,7 +2252,6 @@ class ScaRFSLAM():
             extrinsics_t,
             device=fusion_device,
         )
-        pts_world_batch = pts_world_batch_t.cpu().numpy()
         t_view_world_batch_t = torch.eye(4, dtype=torch.float32, device=fusion_device).repeat(N, 1, 1)
         t_view_world_batch_t[:, :3, :4] = extrinsics_t
         intrinsics_params = [
@@ -2089,146 +2264,24 @@ class ScaRFSLAM():
             for i in range(N)
         ]
 
-        submap_point_ids: Dict[str, np.ndarray] = {}
-        submap_pts_world = np.empty((0, 4), dtype=np.float32)
-        submap_colors = np.empty((0, 3), dtype=np.uint8)
-        submap_point_count = 0
-
-        def _ensure_submap_capacity(min_capacity: int) -> None:
-            nonlocal submap_pts_world, submap_colors, submap_point_count
-            current_capacity = submap_pts_world.shape[0]
-            if current_capacity >= min_capacity:
-                return
-
-            new_capacity = max(
-                min_capacity,
-                1024 if current_capacity == 0 else current_capacity * 2,
-            )
-            while new_capacity < min_capacity:
-                new_capacity *= 2
-
-            new_pts = np.empty((new_capacity, 4), dtype=np.float32)
-            new_colors = np.empty((new_capacity, 3), dtype=np.uint8)
-            if submap_point_count > 0:
-                new_pts[:submap_point_count] = submap_pts_world[:submap_point_count]
-                new_colors[:submap_point_count] = submap_colors[:submap_point_count]
-            submap_pts_world = new_pts
-            submap_colors = new_colors
-
-        def _append_submap_points(pts_unmatched: np.ndarray, rgb_unmatched: np.ndarray) -> np.ndarray:
-            nonlocal submap_pts_world, submap_colors, submap_point_count
-            n_new = int(pts_unmatched.shape[0])
-            if n_new == 0:
-                return np.empty((0,), dtype=np.int64)
-
-            start_idx = submap_point_count
-            end_idx = start_idx + n_new
-            _ensure_submap_capacity(end_idx)
-            submap_pts_world[start_idx:end_idx] = pts_unmatched
-            submap_colors[start_idx:end_idx] = rgb_unmatched
-            submap_point_count = end_idx
-            return np.arange(start_idx, end_idx, dtype=np.int64)
-
-        # Point cloud fusion
+        # Point cloud fusion (scarf_slam/mapping/fusion.py: fuse_submap_frames; SCARF_FUSION_GPU=0 selects the original numpy loop)
         fusion_start_time = time.perf_counter()
+        ts_keys = [_get_ts_key(est_poses_sub, i) for i in range(N)]
+        if os.environ.get("SCARF_FUSION_DUMP") and not getattr(self, "_fusion_dumped", 0) >= 5:   # debug: inputs of the first submaps for the numpy-vs-gpu test
+            self._fusion_dumped = getattr(self, "_fusion_dumped", 0) + 1
+            np.savez(os.path.join(os.environ["SCARF_FUSION_DUMP"], f"fusion_in_{self._fusion_dumped}.npz"), imgs=imgs, confs=confs, pts=pts_world_batch_t.cpu().numpy(),
+                     depths=depths, tvw=t_view_world_batch_t.cpu().numpy(), intr=np.array(intrinsics_params, dtype=np.float64), keys=np.array(ts_keys),
+                     overlap=self.overlap_ph_views, pcf=bool(self.point_cloud_fusion))
+        submap_pts_world, submap_colors, submap_point_ids = map_fusion.fuse_submap_frames(
+            imgs, confs, pts_world_batch_t, depths_t, t_view_world_batch_t, intrinsics_params, ts_keys, self.overlap_ph_views,
+            bool(self.point_cloud_fusion), gpu=os.environ.get("SCARF_FUSION_GPU", "1") != "0")
+        submap_point_count = submap_pts_world.shape[0]
         for i in range(N):
-            depth_i = depths[i]
-            conf_i = confs[i]
-            img_i = imgs[i]
-            pts_world_i = pts_world_batch[i]
-            pts_world_i_flat = pts_world_i.reshape(-1, 3)
-            ts_key_i = _get_ts_key(est_poses_sub, i)
-
-            pts_world_ids = np.full((H, W), -1, dtype=np.int64)
-
-            if submap_point_count > 0:
-                for project_idx in range(i - 1, max(-1, i - self.overlap_ph_views - 1), -1):
-                    if project_idx == i:
-                        continue
-
-                    ts_key_old = _get_ts_key(est_poses_sub, project_idx)
-                    if ts_key_old not in submap_point_ids:
-                        continue
-
-                    pts_world_ids_old = submap_point_ids[ts_key_old]
-                    if self.point_cloud_fusion:
-                        matching_unique = map_fusion.get_matching_torch(
-                            pts_world_1=pts_world_batch_t[i],
-                            mask_1=(pts_world_ids == -1),
-                            depth_2=depths_t[project_idx],
-                            T_view_world_2=t_view_world_batch_t[project_idx],
-                            intrinsics_2=intrinsics_params[project_idx],
-                            depth_thresh=0.05,
-                            unique_mapping=True,
-                        )
-                    else:
-                        matching_unique = np.full((H, W, 2), -1, dtype=np.int32)
-
-                    matching_unique[pts_world_ids != -1] = -1
-                    rows = matching_unique[:, :, 0]
-                    cols = matching_unique[:, :, 1]
-                    fill_mask = (rows >= 0) & (cols >= 0)
-                    if np.any(fill_mask):
-                        matched_rows = rows[fill_mask].astype(np.int64)
-                        matched_cols = cols[fill_mask].astype(np.int64)
-                        prev_ids = pts_world_ids_old[matched_rows, matched_cols]
-                        existing_ids = pts_world_ids[pts_world_ids != -1]
-                        unique_mask = ~np.isin(prev_ids, existing_ids)
-                        fill_idx = np.flatnonzero(fill_mask)
-                        pts_world_ids.flat[fill_idx[unique_mask]] = prev_ids[unique_mask]
-
-                    if np.all(pts_world_ids != -1):
-                        break
-
-                fill_mask = pts_world_ids != -1
-                if np.any(fill_mask):
-                    matched_ids = pts_world_ids[fill_mask]
-                    colors_new = img_i[fill_mask].astype(np.uint8)
-                    pts_new = pts_world_i[fill_mask].astype(np.float32)
-                    conf_new = conf_i[fill_mask].astype(np.float32)
-                    colors_matched = submap_colors[matched_ids].astype(np.uint8, copy=False)
-                    pts_matched = submap_pts_world[matched_ids, :3].astype(np.float32, copy=False)
-                    conf_matched = submap_pts_world[matched_ids, 3].astype(np.float32, copy=False)
-
-                    fused_colors, fused_pts, fused_conf = map_fusion.fuse_overlaps_torch(
-                        colors_1=colors_new,
-                        pts_world_1=pts_new,
-                        conf_1=conf_new,
-                        colors_2=colors_matched,
-                        pts_world_2=pts_matched,
-                        conf_2=conf_matched,
-                    )
-                    submap_colors[matched_ids] = fused_colors.astype(np.uint8)
-                    submap_pts_world[matched_ids, :3] = fused_pts.astype(np.float32)
-                    submap_pts_world[matched_ids, 3] = fused_conf.astype(np.float32)
-
-            vals = pts_world_ids[pts_world_ids != -1]
-            if np.unique(vals).size != vals.size:
-                raise ValueError("pts_world_ids contains duplicate IDs (excluding -1)")
-
-            unmatched_mask = pts_world_ids == -1
-            flat_unmatched_mask = unmatched_mask.ravel()
-            if np.any(flat_unmatched_mask):
-                pts_unmatched_xyz = pts_world_i_flat[flat_unmatched_mask].astype(np.float32, copy=False)
-                conf_unmatched = conf_i.ravel()[flat_unmatched_mask].astype(np.float32, copy=False)
-                pts_unmatched = np.empty((pts_unmatched_xyz.shape[0], 4), dtype=np.float32)
-                pts_unmatched[:, :3] = pts_unmatched_xyz
-                pts_unmatched[:, 3] = conf_unmatched
-                rgb_flat = img_i.reshape(-1, 3)
-                rgb_unmatched = rgb_flat[flat_unmatched_mask]
-                if pts_unmatched.shape[0] > 0:
-                    new_ids = _append_submap_points(pts_unmatched, rgb_unmatched)
-                    pts_world_ids_flat = pts_world_ids.ravel()
-                    pts_world_ids_flat[flat_unmatched_mask] = new_ids
-                    pts_world_ids = pts_world_ids_flat.reshape(H, W)
-
-            submap_point_ids[ts_key_i] = pts_world_ids.copy()
-
             E = np.eye(4, dtype=np.float32)
             E[:3, :4] = extrinsics[i]
             camera_pose = self.transforms.matrix_to_pose(np.linalg.inv(E))
             poses_out.append((est_poses_sub[i][0], camera_pose))
-            self.out_ph_poses_dict[_get_ts_key(est_poses_sub, i)] = camera_pose
+            self.out_ph_poses_dict[ts_keys[i]] = camera_pose
         pts_fusion_duration = self._add_elapsed_time("fuse_pts_time", fusion_start_time)
 
         # Validate point-id maps and anchor (for debugging only).
@@ -2372,7 +2425,7 @@ class ScaRFSLAM():
             poses_file.flush()
 
 
-    def _save_graph_frame_inputs(self, frames_dir: Path) -> Dict[str, Dict[str, object]]:
+    def _save_graph_frame_inputs(self, frames_dir: Path, save_images: bool = True) -> Dict[str, Dict[str, object]]:
         frames_dir.mkdir(parents=True, exist_ok=True)
         graph = self.covisibility_graph
         frame_keys = sorted(
@@ -2386,7 +2439,7 @@ class ScaRFSLAM():
             frame_dir = frames_dir / frame_key
             frame_info: Dict[str, object] = {}
 
-            image = graph._frame_image_dict.get(frame_key)
+            image = graph._frame_image_dict.get(frame_key) if save_images else None
             if image is not None:
                 image = np.asarray(image, dtype=np.uint8)
                 graph_io.save_graph_array(frame_dir / "image.npy", image)
@@ -2547,9 +2600,17 @@ class ScaRFSLAM():
         tmp_output_dir.mkdir(parents=True, exist_ok=True)
 
         graph = self.covisibility_graph
-        submap_manifest = self._save_graph_submaps(tmp_output_dir / "submaps")
-        frame_manifest = self._save_graph_frame_inputs(tmp_output_dir / "frames")
-        match_manifest = self._save_graph_matches(tmp_output_dir / "matches")
+        # Submaps, pairwise matches and frame images are what a later session needs to continue from this graph
+        # (prev_slam_folder). save_graph_debug_artifacts=False skips them and keeps the manifest, poses and the
+        # per-frame intrinsics/confidence.
+        save_debug = bool(self.config.get("save_graph_debug_artifacts", True))
+        submap_manifest = self._save_graph_submaps(tmp_output_dir / "submaps") if save_debug else {}
+        frame_manifest = self._save_graph_frame_inputs(tmp_output_dir / "frames", save_images=save_debug)
+        match_manifest = (
+            self._save_graph_matches(tmp_output_dir / "matches")
+            if save_debug
+            else {"frame_pair_matches": {}, "covisible_frame_pairs_by_submap": {}}
+        )
 
         manifest = {
             "schema_version": 1,
@@ -2635,24 +2696,58 @@ class ScaRFSLAM():
         return output_dir
 
 
+    # Open3D's LZF-compressed PCD writer keeps the payload size in an int32; x y z rgb take 16 bytes per point.
+    _COMPRESSED_PCD_MAX_POINTS = (2**31 - 1) // 16
+
+    def _pointcloud_format(self) -> str:
+        """pointcloud_format: "ply" (default; binary PLY, one numpy write, no size limit) or "pcd" (LZF-compressed PCD)."""
+        fmt = str(self.config.get("pointcloud_format", "ply")).lower()
+        if fmt not in ("ply", "pcd"):
+            raise ValueError(f"pointcloud_format must be 'ply' or 'pcd', got {fmt!r}.")
+        return fmt
+
     def save_global_pointcloud(self, pts_global, colors_global, suffix=""):
-        o3d = _require_open3d()
         conf = pts_global[:, 3]
         mask = conf != 0.0
 
         if np.any(mask):
-            pcd_global = o3d.geometry.PointCloud()
-            pcd_global.points = o3d.utility.Vector3dVector(
-                pts_global[mask, :3].astype(np.float64)
-            )
-            pcd_global.colors = o3d.utility.Vector3dVector(
-                colors_global[mask].astype(np.float32) / 255.0
-            )
             recon_dir = Path(self.slam_folder) / "recon" / self.recon_save_folder_name
             recon_dir.mkdir(parents=True, exist_ok=True)
-            o3d.io.write_point_cloud(
-                str(recon_dir / f"pts_global{suffix}.pcd"), pcd_global, compressed=True
-            )
+            if self._pointcloud_format() == "ply":
+                # The whole cloud, at full resolution: binary PLY has no size limit and LZF gains ~nothing on float positions.
+                write_ply_xyzrgb(
+                    str(recon_dir / f"pts_global{suffix}.ply"),
+                    np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32),
+                    colors_global[mask],
+                )
+                return
+            o3d = _require_open3d()
+            out_path = str(recon_dir / f"pts_global{suffix}.pcd")
+            xyz = np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32)
+            rgb = colors_global[mask].astype(np.float32) / np.float32(255.0)
+            num_points = len(xyz)
+            if num_points > self._COMPRESSED_PCD_MAX_POINTS:
+                # Too large for a compressed PCD: keep the mean point of each voxel, at the finest voxel size that fits
+                # (each size is applied to the full cloud).
+                for voxel_size in (0.02, 0.03, 0.04, 0.05, 0.08):
+                    xyz_down, rgb_down = voxel_downsample_mean(xyz, rgb, voxel_size)
+                    if len(xyz_down) <= self._COMPRESSED_PCD_MAX_POINTS:
+                        print(
+                            f"global point cloud of {num_points} points exceeds the compressed-PCD size limit; "
+                            f"writing it voxel-downsampled ({voxel_size} m, {len(xyz_down)} points)",
+                            flush=True,
+                        )
+                        xyz, rgb = xyz_down, rgb_down
+                        break
+            # The PCD stores float32 positions and colors, so build a tensor point cloud from float32 arrays directly:
+            # the legacy Vector3dVector path first converts to float64 with an element-wise copy (tens of seconds for
+            # ~1e8 points). The written file is byte-identical.
+            pcd_global = o3d.t.geometry.PointCloud()
+            pcd_global.point.positions = o3d.core.Tensor(xyz)
+            pcd_global.point.colors = o3d.core.Tensor(np.ascontiguousarray(rgb))
+            if not o3d.t.io.write_point_cloud(out_path, pcd_global, compressed=True):
+                print(f"compressed PCD write failed for {len(xyz)} points; writing uncompressed", flush=True)
+                o3d.t.io.write_point_cloud(out_path, pcd_global, compressed=False)
 
 
     def save_per_frame_local_pointclouds(self, output_dir: Union[str, Path]) -> None:
@@ -2706,11 +2801,14 @@ class ScaRFSLAM():
                 if not np.any(finite_mask):
                     continue
 
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
-                pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
-                pcd_path = output_dir / f"cloud_{frame_key}.pcd"
-                o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
+                if self._pointcloud_format() == "ply":
+                    write_ply_xyzrgb(str(output_dir / f"cloud_{frame_key}.ply"), pts_local[finite_mask], colors[finite_mask])
+                else:
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
+                    pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
+                    pcd_path = output_dir / f"cloud_{frame_key}.pcd"
+                    o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
                 poses_tum_dict[frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)
@@ -2760,13 +2858,15 @@ class ScaRFSLAM():
             if not np.any(finite_mask):
                 continue
 
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
-            pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
-
             sec_str, nsec_str = last_frame_key.split("_")
-            pcd_path = output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.pcd"
-            o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
+            if self._pointcloud_format() == "ply":
+                write_ply_xyzrgb(str(output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.ply"), pts_local[finite_mask], colors[finite_mask])
+            else:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
+                pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
+                pcd_path = output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.pcd"
+                o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
             poses_tum_dict[last_frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)
@@ -2811,9 +2911,10 @@ def main(args=None):
     )
     parsed_args = parser.parse_args(args)
     using_bag_input = parsed_args.input_bag is not None
-    using_file_input = parsed_args.image_folder is not None or parsed_args.poses is not None
+    bag_pose_file_input = using_bag_input and parsed_args.poses is not None and parsed_args.image_folder is None
+    using_file_input = (parsed_args.image_folder is not None or parsed_args.poses is not None) and not bag_pose_file_input
     if using_bag_input == using_file_input:
-        parser.error("Pass either --input_bag or both --image_folder and --poses.")
+        parser.error("Pass --input_bag, or --image_folder with --poses, or --input_bag with --poses (bag images + pose file).")
     if using_file_input and (parsed_args.image_folder is None or parsed_args.poses is None):
         parser.error("--image_folder and --poses must be provided together.")
 

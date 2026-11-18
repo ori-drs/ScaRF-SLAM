@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from collections import OrderedDict
+from typing import Dict, Iterator, List, Mapping, Optional, Tuple
 
+import cv2
 import imageio.v2 as imageio
 import numpy as np
 
@@ -95,6 +98,19 @@ def _array_or_bytes_to_bytes(data) -> bytes:
     return np.asarray(data, dtype=np.uint8).tobytes()
 
 
+class _ImageFilePayloads(Mapping):
+    """The image-folder input as a mapping of the same shape as the bag's compressed images, read from disk on demand.
+    Holding every payload costs ~2.8 MB per frame, i.e. tens of GB on a long sequence, for data the app reads once."""
+
+    def __init__(self, paths: Dict[str, Path]): self._paths = dict(paths)
+
+    def __getitem__(self, key: str) -> bytes: return _compressed_image_payload(self._paths[key])[1].tobytes()
+
+    def __iter__(self) -> Iterator[str]: return iter(self._paths)
+
+    def __len__(self) -> int: return len(self._paths)
+
+
 @dataclass
 class SlamBagData:
     bag_path: Path
@@ -103,7 +119,11 @@ class SlamBagData:
     compressed_images: Dict[str, bytes]
     image_formats: Dict[str, str] = field(default_factory=dict)
     image_camera: str = "cam0"
-    _decoded_images: Dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _decoded_images: "OrderedDict[str, np.ndarray]" = field(default_factory=OrderedDict, init=False, repr=False)
+    # A decoded frame is ~11 MB at 1920x1920, so caching every frame of a long sequence costs tens of GB. Measured over a
+    # 5391-frame run: 500 reads covered 417 distinct frames and every hit was on the frame read immediately before
+    # (reuse distance 1), so a handful of entries captures all of the reuse. SCARF_IMAGE_CACHE=0 restores the old behaviour.
+    image_cache_size: int = int(os.environ.get("SCARF_IMAGE_CACHE", 8))
 
     @property
     def trajectory_snapshot_timestamps(self) -> List[str]:
@@ -131,10 +151,45 @@ class SlamBagData:
                 f"Compressed image for {cam_name} at {timestamp} was not found in {self.bag_path}"
             )
         if timestamp not in self._decoded_images:
-            self._decoded_images[timestamp] = np.asarray(
-                imageio.imread(io.BytesIO(self.compressed_images[timestamp]))
-            )
+            fut = self._prefetch_futs.pop(timestamp, None) if hasattr(self, "_prefetch_futs") else None
+            self._decoded_images[timestamp] = fut.result() if fut is not None else self._decode_bytes(timestamp)
+            if self.image_cache_size:
+                while len(self._decoded_images) > self.image_cache_size: self._decoded_images.popitem(last=False)
+        else:
+            self._decoded_images.move_to_end(timestamp)
+        self._prefetch_after(timestamp)
         return self._decoded_images[timestamp]
+
+    def _decode_bytes(self, timestamp: str) -> np.ndarray:
+        # cv2 (libjpeg-turbo) decodes the same pixels as imageio/Pillow for these JPEGs, ~1.6x faster (verified on the UniPark bags)
+        buf = np.frombuffer(self.compressed_images[timestamp], dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            img = np.asarray(imageio.imread(io.BytesIO(self.compressed_images[timestamp])))
+        elif img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        return img
+
+    def _prefetch_after(self, timestamp: str) -> None:
+        """Decode the next SCARF_IMAGE_PREFETCH frames (time order) on a background thread (cv2 releases the GIL): the mapper walks
+        the frames in order, so the keyframes of the next batch are decoded while the current one is processed (2026-11-06)."""
+        n = int(os.environ.get("SCARF_IMAGE_PREFETCH", "0"))
+        if n <= 0: return
+        if not hasattr(self, "_prefetch_futs"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._prefetch_pool = ThreadPoolExecutor(2, thread_name_prefix="img_prefetch"); self._prefetch_futs = {}
+            self._ts_order = sorted(self.compressed_images); self._ts_index = {t: i for i, t in enumerate(self._ts_order)}
+        i = self._ts_index.get(timestamp)
+        if i is None: return
+        allowed = getattr(self, "prefetch_allowed", None)   # live semantics: a frame can only be decoded once it has been captured (set by a paced driver)
+        for t in self._ts_order[i + 1: i + 1 + n]:
+            if allowed is not None and not allowed(t): break
+            if t not in self._decoded_images and t not in self._prefetch_futs:
+                self._prefetch_futs[t] = self._prefetch_pool.submit(self._decode_bytes, t)
+        if len(self._prefetch_futs) > 4 * n:   # frames the mapper skipped (not keyframes): drop the oldest results
+            for t in list(self._prefetch_futs)[: len(self._prefetch_futs) - 2 * n]: self._prefetch_futs.pop(t)
 
 
 def load_slam_bag(
@@ -282,13 +337,13 @@ def load_image_folder_and_poses(
     image_files = _collect_image_files(resolved_image_folder)
     poses = read_pose_file(poses_path)
 
-    compressed_images: Dict[str, bytes] = {}
+    image_paths: Dict[str, Path] = {}
     image_formats: Dict[str, str] = {}
     for timestamp_nsec, image_path in image_files:
-        image_format, payload = _compressed_image_payload(image_path)
         key = _timestamp_nsec_key(timestamp_nsec)
-        compressed_images[key] = payload.tobytes()
-        image_formats[key] = image_format
+        image_paths[key] = image_path
+        image_formats[key] = image_path.suffix.lstrip(".").lower() or "jpeg"
+    compressed_images = _ImageFilePayloads(image_paths)   # read on demand: the folder is already on disk
 
     pose_dict: Dict[str, MappingPose] = {}
     last_pose_nsec: Optional[int] = None
@@ -316,5 +371,142 @@ def load_image_folder_and_poses(
         trajectory_snapshots={snapshot_key: pose_dict},
         odometry=pose_dict.copy(),
         compressed_images=compressed_images,
+        image_formats=image_formats,
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Bag images + pose file (2026-10-01): the frames come straight from the recording's mcap (read on demand, one message at a
+# time) and the poses from a TUM file at any rate, interpolated to the frame stamps. Removes the need to extract the bag's
+# JPEGs into an image folder (a 1:1 copy, 200 GB for the CityPark Spot sessions) when the trajectory is a VIO / PGO text file.
+# ---------------------------------------------------------------------------------------------------------------------
+import functools
+
+
+@functools.lru_cache(maxsize=8)
+def index_bag_images(bag_path: str, image_topic: str) -> Tuple[Tuple[int, int, str], ...]:
+    """One pass over the image topic: (header stamp ns, bag log time ns, format) per message, sorted by header stamp.
+    Cached per (bag, topic) so the timestamp sync and the loader share it."""
+    from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
+    from scarf_slam.integrations.slam_bag_time_sync import _stamp_to_nsec
+
+    resolved = Path(bag_path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Input bag was not found: {resolved}")
+    typestore = get_typestore(Stores.ROS2_JAZZY)
+    rows: List[Tuple[int, int, str]] = []
+    with AnyReader([resolved], default_typestore=typestore) as reader:
+        connections = [c for c in reader.connections if c.topic == image_topic]
+        if not connections:
+            available = ", ".join(sorted(c.topic for c in reader.connections)) or "<none>"
+            raise FileNotFoundError(f"Missing image topic {image_topic!r} in {resolved}. Available topics: {available}")
+        if connections[0].msgtype != "sensor_msgs/msg/CompressedImage":
+            raise TypeError(f"Image topic {image_topic!r} has type {connections[0].msgtype}, expected sensor_msgs/msg/CompressedImage")
+        for connection, log_nsec, rawdata in reader.messages(connections=connections):
+            msg = reader.deserialize(rawdata, connection.msgtype)
+            rows.append((_stamp_to_nsec(msg.header.stamp), int(log_nsec), str(getattr(msg, "format", "") or "jpeg")))
+    if not rows:
+        raise FileNotFoundError(f"No image messages were found on {image_topic} in {resolved}")
+    return tuple(sorted(rows))
+
+
+class _BagImagePayloads(Mapping):
+    """Compressed frames of a bag as a mapping keyed like the other inputs, each message read from the mcap when asked for
+    (the app reads frames once, in order; rosbags' start/stop window makes a single-message read cheap)."""
+
+    def __init__(self, bag_path: Path, image_topic: str, log_nsec_by_key: Dict[str, int], header_nsec_by_key: Dict[str, int]):
+        self._bag_path = bag_path; self._image_topic = image_topic
+        self._log = dict(log_nsec_by_key); self._hdr = dict(header_nsec_by_key); self._reader = None; self._connections = None
+
+    def _open(self):
+        if self._reader is None:
+            from rosbags.highlevel import AnyReader
+            from rosbags.typesys import Stores, get_typestore
+            self._reader = AnyReader([self._bag_path], default_typestore=get_typestore(Stores.ROS2_JAZZY)); self._reader.open()
+            self._connections = [c for c in self._reader.connections if c.topic == self._image_topic]
+        return self._reader
+
+    def __getitem__(self, key: str) -> bytes:
+        from scarf_slam.integrations.slam_bag_time_sync import _stamp_to_nsec
+        if key not in self._log:
+            raise KeyError(key)
+        reader = self._open(); t = self._log[key]; want = self._hdr[key]
+        for connection, _, rawdata in reader.messages(connections=self._connections, start=t - 1000, stop=t + 1000):   # rosbags' start is exclusive: a 1 us window around the log time
+            msg = reader.deserialize(rawdata, connection.msgtype)
+            if _stamp_to_nsec(msg.header.stamp) == want:
+                return _array_or_bytes_to_bytes(msg.data)
+        raise KeyError(f"Image {key} not found in {self._bag_path} at log time {t}")
+
+    def __iter__(self) -> Iterator[str]: return iter(self._log)
+
+    def __len__(self) -> int: return len(self._log)
+
+    def __del__(self):
+        try:
+            if self._reader is not None: self._reader.close()
+        except Exception: pass
+
+
+def select_bag_frames(bag_path: str | Path, image_topic: str, frame_stride: int = 1) -> List[Tuple[int, int, str]]:
+    """Every `frame_stride`-th image message (header ns, log ns, format), as the extraction scripts' --step did."""
+    rows = index_bag_images(str(Path(bag_path).expanduser()), image_topic)
+    return list(rows[:: max(1, int(frame_stride))])
+
+
+def interpolate_poses_at(poses: List[Tuple], stamps_nsec: List[int]) -> Dict[int, MappingPose]:
+    """TUM poses (sec, nsec, x, y, z, qx, qy, qz, qw) interpolated at the given stamps: positions linearly, rotations by
+    slerp; stamps outside the pose span are left out (as spot_extract.py / spot_serial_poses.py do)."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    t = np.array([int(p[0]) + int(p[1]) * 1e-9 for p in poses], dtype=np.float64)
+    keep = np.concatenate([[True], np.diff(t) > 1e-9]); t = t[keep]
+    P = np.array([[p[2], p[3], p[4]] for p in poses], dtype=np.float64)[keep]
+    Q = np.array([[p[5], p[6], p[7], p[8]] for p in poses], dtype=np.float64)[keep]
+    slerp = Slerp(t, Rotation.from_quat(Q))
+    out: Dict[int, MappingPose] = {}
+    for s in stamps_nsec:
+        ts = s * 1e-9
+        if ts < t[0] or ts > t[-1]:
+            continue
+        pos = [float(np.interp(ts, t, P[:, i])) for i in range(3)]
+        quat = slerp([ts]).as_quat()[0]
+        out[s] = MappingPose(pos, [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])])
+    return out
+
+
+def load_bag_images_and_poses(
+    bag_path: str | Path,
+    poses_path: str | Path,
+    *,
+    image_topic: str,
+    frame_stride: int = 1,
+    pose_timestamp_map: Optional[Mapping[int, int]] = None,
+) -> SlamBagData:
+    """Bag images (on demand) + TUM pose file interpolated at the selected frames' stamps (use_slam: false only)."""
+    from scarf_slam.integrations.slam_bag_time_sync import _timestamp_nsec_key, read_pose_file
+
+    resolved_bag_path = Path(bag_path).expanduser()
+    frames = select_bag_frames(resolved_bag_path, image_topic, frame_stride)
+    poses = read_pose_file(poses_path)
+    interpolated = interpolate_poses_at(poses, [hdr for hdr, _, _ in frames])
+    if not interpolated:
+        raise FileNotFoundError(f"No frame of {resolved_bag_path} falls inside the pose span of {poses_path}")
+    log_by_key: Dict[str, int] = {}; hdr_by_key: Dict[str, int] = {}; image_formats: Dict[str, str] = {}; pose_dict: Dict[str, MappingPose] = {}
+    last_nsec: Optional[int] = None
+    for hdr, log_nsec, fmt in frames:
+        if hdr not in interpolated:
+            continue
+        target_nsec = hdr if pose_timestamp_map is None else pose_timestamp_map.get(hdr, hdr)
+        key = _timestamp_nsec_key(target_nsec)
+        log_by_key[key] = log_nsec; hdr_by_key[key] = hdr; image_formats[key] = fmt.lower() or "jpeg"
+        pose_dict[key] = interpolated[hdr]; last_nsec = target_nsec
+    print(f"[slam_bag] bag images + pose file: {len(frames)} frames (stride {frame_stride}) of {resolved_bag_path.name}, "
+          f"{len(pose_dict)} inside the pose span of {Path(poses_path).name}")
+    return SlamBagData(
+        bag_path=resolved_bag_path,
+        trajectory_snapshots={_timestamp_nsec_key(last_nsec): pose_dict},
+        odometry=pose_dict.copy(),
+        compressed_images=_BagImagePayloads(resolved_bag_path, image_topic, log_by_key, hdr_by_key),
         image_formats=image_formats,
     )

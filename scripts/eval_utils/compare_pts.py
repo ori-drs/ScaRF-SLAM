@@ -13,7 +13,7 @@ import open3d as o3d
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
-PCD_TIMESTAMP_RE = re.compile(r"^(?:cloud_)?(\d+)_(\d+)\.pcd$")
+PCD_TIMESTAMP_RE = re.compile(r"^(?:cloud_)?(\d+)_(\d+)\.(?:pcd|ply)$")   # ScaRF writes .ply by default (pointcloud_format)
 VIS_REFERENCE_VOXEL_SIZE_M = 0.10
 
 
@@ -319,7 +319,7 @@ def apply_sim3_to_cloud(
 ) -> o3d.geometry.PointCloud:
     transformed = o3d.geometry.PointCloud(cloud)
     points = np.asarray(transformed.points, dtype=np.float64)
-    transformed.points = o3d.utility.Vector3dVector(apply_sim3(points, scale, rotation, translation))
+    transformed.points = o3d.utility.Vector3dVector(np.ascontiguousarray(apply_sim3(points, scale, rotation, translation), dtype=np.float64))
     return transformed
 
 
@@ -377,7 +377,7 @@ def build_world_cloud_for_entries(
 
     cloud = o3d.geometry.PointCloud()
     merged_points = np.concatenate(world_points, axis=0)
-    cloud.points = o3d.utility.Vector3dVector(merged_points)
+    cloud.points = o3d.utility.Vector3dVector(np.ascontiguousarray(merged_points, dtype=np.float64))
 
     if has_any_colors:
         merged_colors = []
@@ -387,7 +387,7 @@ def build_world_cloud_for_entries(
                 merged_colors.append(fallback)
             else:
                 merged_colors.append(colors)
-        cloud.colors = o3d.utility.Vector3dVector(np.concatenate(merged_colors, axis=0))
+        cloud.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(np.concatenate(merged_colors, axis=0), dtype=np.float64))
 
     return cloud
 
@@ -574,7 +574,7 @@ def visualize_distances(
 ) -> None:
     if recall_only:
         gt_vis = o3d.geometry.PointCloud(gt_cloud)
-        gt_vis.colors = o3d.utility.Vector3dVector(colors_by_distance(gt_to_recon_dists, max_distance_m))
+        gt_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(colors_by_distance(gt_to_recon_dists, max_distance_m), dtype=np.float64))
         clouds = [gt_vis]
         if include_reference:
             recon_vis = o3d.geometry.PointCloud(recon_cloud)
@@ -586,11 +586,11 @@ def visualize_distances(
         return
 
     recon_vis = o3d.geometry.PointCloud(recon_cloud)
-    recon_vis.colors = o3d.utility.Vector3dVector(colors_by_distance(recon_to_gt_dists, max_distance_m))
+    recon_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(colors_by_distance(recon_to_gt_dists, max_distance_m), dtype=np.float64))
     clouds = []
     if include_reference:
         gt_vis = voxel_downsample(gt_cloud, VIS_REFERENCE_VOXEL_SIZE_M)
-        gt_vis.colors = o3d.utility.Vector3dVector(green_colors_by_height(gt_vis))
+        gt_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(green_colors_by_height(gt_vis), dtype=np.float64))
         clouds.append(gt_vis)
     clouds.append(recon_vis)
     show_clouds(f"Recon distance to GT (0-{max_distance_m:.3f}m, threshold={threshold_m:.4f}m)", clouds)
@@ -610,7 +610,7 @@ def visualize_outliers(
         gt_vis = o3d.geometry.PointCloud(gt_cloud)
         gt_colors = green_colors_by_height(gt_vis)
         gt_colors[gt_to_recon_dists > threshold_m] = outlier_color
-        gt_vis.colors = o3d.utility.Vector3dVector(gt_colors)
+        gt_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(gt_colors, dtype=np.float64))
         clouds = [gt_vis]
         if include_reference:
             recon_vis = o3d.geometry.PointCloud(recon_cloud)
@@ -624,11 +624,11 @@ def visualize_outliers(
     recon_vis = o3d.geometry.PointCloud(recon_cloud)
     recon_colors = cloud_colors(recon_vis, np.array([0.1, 0.7, 1.0], dtype=np.float64))
     recon_colors[recon_to_gt_dists > threshold_m] = outlier_color
-    recon_vis.colors = o3d.utility.Vector3dVector(recon_colors)
+    recon_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(recon_colors, dtype=np.float64))
     clouds = []
     if include_reference:
         gt_vis = voxel_downsample(gt_cloud, VIS_REFERENCE_VOXEL_SIZE_M)
-        gt_vis.colors = o3d.utility.Vector3dVector(green_colors_by_height(gt_vis))
+        gt_vis.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(green_colors_by_height(gt_vis), dtype=np.float64))
         clouds.append(gt_vis)
     clouds.append(recon_vis)
     show_clouds(f"Recon outliers (red, threshold={threshold_m:.4f}m)", clouds)
@@ -757,8 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--recon",
         required=True,
         help=(
-            "Either a folder containing recon per-pose .pcd files named {sec}_{nsec}.pcd or "
-            "cloud_{sec}_{nsec}.pcd, or a single recon .pcd already in world coordinates."
+            "Either a folder containing recon per-pose .pcd/.ply files named {sec}_{nsec}.pcd or "
+            "cloud_{sec}_{nsec}.ply (or .pcd), or a single recon .ply/.pcd already in world coordinates."
         ),
     )
     parser.add_argument(
